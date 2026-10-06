@@ -1,0 +1,23 @@
+name: backtest
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python backtest.py
+      - run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase
+          git add docs
+          git commit -m "backtest $(date +%F)" || echo "no change"
+          git push
