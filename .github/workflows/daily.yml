@@ -1,0 +1,23 @@
+name: daily-screen
+on:
+  schedule:
+    - cron: "30 7 * * 1-5"   # 平日16:30(日本時間)
+  workflow_dispatch:          # 手動実行ボタン
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python screener.py
+      - run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add docs
+          git commit -m "update $(date +%F)" || echo "no change"
+          git push
