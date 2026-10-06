@@ -21,7 +21,7 @@ jobs:
       - run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
-          git pull --rebase
           git add docs
           git commit -m "backtest $(date +%F)" || echo "no change"
+          git pull --rebase
           git push
