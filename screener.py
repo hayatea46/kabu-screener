@@ -19,6 +19,7 @@ MIN_RR = 1.0         # リスクリワード1未満は載せない
 TOP_N = 30           # 条件ごとの最大表示数
 COUNCIL_N = 10       # エージェント協議に回す銘柄数
 MIN_EDGE = 0.1       # 過去検証の期待値Rがこれ未満の条件は、タブと協議候補から外す
+MIN_N = 100          # 過去検証の件数がこれ未満の区分は、外す・残すの判断に使わない（参考表示）
 CHUNK = 100
 
 STRATEGIES = {
@@ -207,23 +208,31 @@ def market_mood():
 
 
 def load_edge(mood):
-    """docs/backtest.json から、今の地合いでの条件別の期待値Rを返す（{条件名: R}）。
-    ファイルが無い・読めない場合は空。地合いが不明、またはその地合いの値が無い条件は「全体」で判断。"""
+    """docs/backtest.json から、条件ごとの期待値Rを返す（{条件名: {"r": R, "ref": 参考か}}）。
+    実際に買える銘柄（100株が資金内・損切り損失が上限内）の成績を使う。
+    今の地合いの件数が MIN_N 未満なら「全体」に戻し、それも少なければ参考表示（判断に使わない）。
+    ファイルが無い・読めない場合は空。古い形式（買える集計なし）は全銘柄の値で同じ判断をする。"""
     try:
         rows = json.loads((OUT / "backtest.json").read_text(encoding="utf-8"))
     except Exception:
         return {}
     edge = {}
     for r in rows:
-        v = r.get(mood[0]) or r.get("全体")
-        if v and "期待値R" in v:
-            edge[r["条件"]] = v["期待値R"]
+        src = r.get("買える") or {t: r.get(t) for t in ("全体", "追い風", "向かい風")}
+        order = [mood[0], "全体"] if mood[0] in ("追い風", "向かい風") else ["全体"]
+        cands = [src.get(t) for t in order if src.get(t) and "期待値R" in src[t]]
+        enough = [v for v in cands if v["件数"] >= MIN_N]
+        if enough:
+            edge[r["条件"]] = {"r": enough[0]["期待値R"], "ref": False}
+        elif cands:
+            edge[r["条件"]] = {"r": cands[-1]["期待値R"], "ref": True}
     return edge
 
 
 def active(edge):
-    """期待値Rが基準未満の条件を除いた条件キー（STRATEGIESの順）。値が無い条件は残す。"""
-    return [k for k, (label, _) in STRATEGIES.items() if edge.get(label, MIN_EDGE) >= MIN_EDGE]
+    """期待値Rが基準未満の条件を除いた条件キー（STRATEGIESの順）。値が無い条件・参考表示の条件は残す。"""
+    return [k for k, (label, _) in STRATEGIES.items()
+            if label not in edge or edge[label]["ref"] or edge[label]["r"] >= MIN_EDGE]
 
 
 def screen(data, names):
@@ -309,7 +318,8 @@ def build_site(results, mood, council, keys, edge):
     for i, k in enumerate(keys):
         label, desc = STRATEGIES[k]
         rs = results[k]
-        er = f" R{edge[label]:+.2f}" if label in edge else ""
+        e = edge.get(label)
+        er = f" {'参考' if e['ref'] else ''}R{e['r']:+.2f}" if e else ""
         nav.append(f'<button aria-selected="{str(i == 0).lower()}">{label}{er} {len(rs)}</button>')
         body = "".join(row_html(r) for r in rs) or '<p class="empty">今日は該当なし。条件を満たす銘柄が出るまで待つのも戦略です。</p>'
         secs.append(f'<section{"" if i == 0 else " hidden"}><p class="desc">{desc}。RRの高い順。</p>{body}</section>')
