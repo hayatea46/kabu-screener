@@ -13,7 +13,7 @@ import yfinance as yf
 from screener import CHECKS, MIN_TURNOVER, STRATEGIES, fetch, load_universe
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
-YEARS = 3           # 検証期間
+YEARS = 6           # 検証期間
 MAX_HOLD = 30       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")

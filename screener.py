@@ -18,6 +18,7 @@ MIN_TURNOVER = 1e8   # 20日平均売買代金 1億円未満は除外
 MIN_RR = 1.0         # リスクリワード1未満は載せない
 TOP_N = 30           # 条件ごとの最大表示数
 COUNCIL_N = 10       # エージェント協議に回す銘柄数
+MIN_EDGE = 0.1       # 過去検証の期待値Rがこれ未満の条件は、タブと協議候補から外す
 CHUNK = 100
 
 STRATEGIES = {
@@ -205,6 +206,26 @@ def market_mood():
         return ("不明", "地合いデータを取得できませんでした")
 
 
+def load_edge(mood):
+    """docs/backtest.json から、今の地合いでの条件別の期待値Rを返す（{条件名: R}）。
+    ファイルが無い・読めない場合は空。地合いが不明、またはその地合いの値が無い条件は「全体」で判断。"""
+    try:
+        rows = json.loads((OUT / "backtest.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    edge = {}
+    for r in rows:
+        v = r.get(mood[0]) or r.get("全体")
+        if v and "期待値R" in v:
+            edge[r["条件"]] = v["期待値R"]
+    return edge
+
+
+def active(edge):
+    """期待値Rが基準未満の条件を除いた条件キー（STRATEGIESの順）。値が無い条件は残す。"""
+    return [k for k, (label, _) in STRATEGIES.items() if edge.get(label, MIN_EDGE) >= MIN_EDGE]
+
+
 def screen(data, names):
     results = {k: [] for k in CHECKS}
     for t, d in data.items():
@@ -225,8 +246,8 @@ def screen(data, names):
     return results
 
 
-def council_input(results, mood):
-    pool = [dict(r, strategy=STRATEGIES[k][0]) for k, rs in results.items() for r in rs]
+def council_input(results, mood, keys):
+    pool = [dict(r, strategy=STRATEGIES[k][0]) for k in keys for r in results[k]]
     pool = sorted(pool, key=lambda x: -x["rr"])
     seen, top = set(), []
     for r in pool:
@@ -281,13 +302,15 @@ def row_html(r):
 <div class="order"><div class="stop"><span>損切り</span>{r['stop']:,}円</div><div><span>買い指値</span>{r['entry']:,}円</div><div class="tgt"><span>利確</span>{r['target']:,}円</div></div></div>"""
 
 
-def build_site(results, mood, council):
+def build_site(results, mood, council, keys, edge):
     OUT.mkdir(exist_ok=True)
     cls = {"追い風": "good", "向かい風": "bad"}.get(mood[0], "")
     nav, secs = [], []
-    for i, (k, (label, desc)) in enumerate(STRATEGIES.items()):
+    for i, k in enumerate(keys):
+        label, desc = STRATEGIES[k]
         rs = results[k]
-        nav.append(f'<button aria-selected="{str(i == 0).lower()}">{label} {len(rs)}</button>')
+        er = f" R{edge[label]:+.2f}" if label in edge else ""
+        nav.append(f'<button aria-selected="{str(i == 0).lower()}">{label}{er} {len(rs)}</button>')
         body = "".join(row_html(r) for r in rs) or '<p class="empty">今日は該当なし。条件を満たす銘柄が出るまで待つのも戦略です。</p>'
         secs.append(f'<section{"" if i == 0 else " hidden"}><p class="desc">{desc}。RRの高い順。</p>{body}</section>')
     page = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
@@ -295,7 +318,7 @@ def build_site(results, mood, council):
 <link href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap" rel="stylesheet"><style>{CSS}</style></head>
 <body><main><h1>スイング候補</h1><div class="date">{council['date']} 大引け時点・日足</div>
 <div class="mood {cls}"><b>地合い：{mood[0]}</b><br>{mood[1]}</div>
-<nav>{''.join(nav)}</nav>{''.join(secs)}
+<nav>{''.join(nav)}</nav>{''.join(secs) or '<p class="empty">今の地合いで過去検証の成績が基準を満たす条件がありません。見送りが妥当です。</p>'}
 <footer>注文はIFDOCO（買い指値→利確・損切りを同時セット）を想定。表示は機械的な判定で、売買の判断はご自身で。</footer></main>
 <script>{JS}</script></body></html>"""
     (OUT / "index.html").write_text(page, encoding="utf-8")
@@ -309,7 +332,10 @@ def main():
     print(f"取得 {len(data)} 銘柄")
     mood = market_mood()
     results = screen(data, names)
-    build_site(results, mood, council_input(results, mood))
+    edge = load_edge(mood)
+    keys = active(edge)
+    print(f"地合い {mood[0]} / 期待値R {edge} / 残す条件 {[STRATEGIES[k][0] for k in keys]}")
+    build_site(results, mood, council_input(results, mood, keys), keys, edge)
     print({STRATEGIES[k][0]: len(v) for k, v in results.items()})
 
 
