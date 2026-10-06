@@ -45,12 +45,12 @@ def load_universe():
     return dict(zip(df["コード"].str.strip() + ".T", df["銘柄名"].str.strip()))
 
 
-def fetch(tickers):
+def fetch(tickers, period="14mo"):
     data = {}
     for i in range(0, len(tickers), CHUNK):
         part = tickers[i:i + CHUNK]
         try:
-            raw = yf.download(part, period="14mo", interval="1d", group_by="ticker",
+            raw = yf.download(part, period=period, interval="1d", group_by="ticker",
                               auto_adjust=True, threads=True, progress=False)
         except Exception as e:
             print("取得エラー:", e)
