@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+JPX_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
 OUT = Path("docs")
 MIN_TURNOVER = 1e8   # 20日平均売買代金 1億円未満は除外
 MIN_RR = 1.0         # リスクリワード1未満は載せない
@@ -32,7 +32,15 @@ STRATEGIES = {
 
 # ---------- データ ----------
 def load_universe():
-    df = pd.read_excel(JPX_URL, dtype=str)
+    import io, re, urllib.request
+    ua = {"User-Agent": "Mozilla/5.0"}
+    get = lambda u: urllib.request.urlopen(urllib.request.Request(u, headers=ua), timeout=60).read()
+    page = get(JPX_PAGE).decode("utf-8", "ignore")
+    m = re.search(r'href="([^"]+\.xlsx?)"', page)
+    if not m:
+        raise RuntimeError("JPXの銘柄一覧ファイルが見つかりません")
+    url = m.group(1) if m.group(1).startswith("http") else "https://www.jpx.co.jp" + m.group(1)
+    df = pd.read_excel(io.BytesIO(get(url)), dtype=str)
     df = df[df["市場・商品区分"].str.contains("内国株式", na=False)]
     return dict(zip(df["コード"].str.strip() + ".T", df["銘柄名"].str.strip()))
 
