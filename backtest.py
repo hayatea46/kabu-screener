@@ -37,15 +37,15 @@ def simulate(d, i, s):
         bar = d.iloc[k]
         if bar["Low"] <= s["stop"]:
             px = min(s["stop"], bar["Open"])
-            return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i}
+            return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "損切り"}
         if bar["High"] >= s["target"]:
             px = max(s["target"], bar["Open"]) if k > i + 1 else s["target"]
-            return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i}
+            return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "利確"}
     k = min(i + MAX_HOLD, len(d) - 1)
     if k <= i + 1:
         return None
     px = d["Close"].iloc[k]
-    return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i}
+    return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "期限切れ"}
 
 
 def run_stock(args):
@@ -90,21 +90,25 @@ def summarize(trades, mood):
             row[tag] = {"件数": len(sub), "勝率": round((r > 0).mean() * 100, 1),
                         "期待値R": round(r.mean(), 2),
                         "平均損益%": round(pd.Series([x["ret"] for x in sub]).mean() * 100, 2),
-                        "平均日数": round(pd.Series([x["days"] for x in sub]).mean(), 1)}
+                        "平均日数": round(pd.Series([x["days"] for x in sub]).mean(), 1),
+                        "損切り%": round(sum(x["why"] == "損切り" for x in sub) / len(sub) * 100, 1),
+                        "利確%": round(sum(x["why"] == "利確" for x in sub) / len(sub) * 100, 1),
+                        "期限切れ%": round(sum(x["why"] == "期限切れ" for x in sub) / len(sub) * 100, 1)}
         rows.append(row)
     return rows
 
 
 def cell(v):
     if not v:
-        return "<td colspan=5>なし</td>"
+        return "<td colspan=8>なし</td>"
     good = "good" if v["期待値R"] > 0.1 else "bad" if v["期待値R"] < 0 else ""
     return (f"<td>{v['件数']}</td><td>{v['勝率']}%</td><td class='{good}'>{v['期待値R']:+.2f}</td>"
-            f"<td>{v['平均損益%']:+.2f}%</td><td>{v['平均日数']}</td>")
+            f"<td>{v['平均損益%']:+.2f}%</td><td>{v['平均日数']}</td>"
+            f"<td>{v['損切り%']}%</td><td>{v['利確%']}%</td><td>{v['期限切れ%']}%</td>")
 
 
 def build(rows, n):
-    head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>平均損益</th><th>平均日数</th>"
+    head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th>"
     body = ""
     for tag in ("全体", "追い風", "向かい風"):
         body += f"<h2>{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
@@ -119,7 +123,7 @@ th,td{{border:1px solid #D5DBD9;padding:6px 8px;text-align:right;white-space:now
 .good{{color:#C62E2E;font-weight:700}}.bad{{color:#2A5DA8;font-weight:700}}p{{color:#66706E;font-size:.85rem}}</style></head>
 <body><main><h1>過去{YEARS}年の検証（{n}銘柄）</h1>
 <p>期待値Rは「1回の取引で、損切り幅の何倍を平均で稼げたか」。+0.1以上が実用の目安、マイナスは使わない方がよい条件。
-翌日に指値が約定した取引のみ集計。同日に損切りと利確の両方に届いた日は損切り扱い。</p>{body}
+損切り・利確・期限切れは決済理由の割合（期限切れは最大保有日数で引け売り）。翌日に指値が約定した取引のみ集計。同日に損切りと利確の両方に届いた日は損切り扱い。</p>{body}
 <p>注意：現在上場している銘柄だけで検証しているため、実際より成績がやや良く出る傾向があります。</p></main></body></html>"""
     OUT.mkdir(exist_ok=True)
     (OUT / "backtest.html").write_text(page, encoding="utf-8")
