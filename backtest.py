@@ -17,6 +17,9 @@ YEARS = 6           # 検証期間
 MAX_HOLD = 30       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
+CAPITAL = 100000    # 運用資金（円）
+LOSS_LIMIT = 2000   # 1銘柄の損失上限（円）＝資金の2%
+LOT = 100           # 売買単位（株）
 
 
 def mood_series():
@@ -37,15 +40,15 @@ def simulate(d, i, s):
         bar = d.iloc[k]
         if bar["Low"] <= s["stop"]:
             px = min(s["stop"], bar["Open"])
-            return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "損切り"}
+            return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "損切り", "buy": buy, "risk": risk}
         if bar["High"] >= s["target"]:
             px = max(s["target"], bar["Open"]) if k > i + 1 else s["target"]
-            return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "利確"}
+            return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "利確", "buy": buy, "risk": risk}
     k = min(i + MAX_HOLD, len(d) - 1)
     if k <= i + 1:
         return None
     px = d["Close"].iloc[k]
-    return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "期限切れ"}
+    return {"filled": True, "exit": k, "r": (px - buy) / risk, "ret": px / buy - 1, "days": k - i, "why": "期限切れ", "buy": buy, "risk": risk}
 
 
 def run_stock(args):
@@ -75,25 +78,35 @@ def run_stock(args):
     return trades
 
 
+def stats(sub):
+    if not sub:
+        return None
+    r = pd.Series([x["r"] for x in sub])
+    n = len(sub)
+    return {"件数": n, "勝率": round((r > 0).mean() * 100, 1),
+            "期待値R": round(r.mean(), 2),
+            "平均損益%": round(pd.Series([x["ret"] for x in sub]).mean() * 100, 2),
+            "平均日数": round(pd.Series([x["days"] for x in sub]).mean(), 1),
+            "損切り%": round(sum(x["why"] == "損切り" for x in sub) / n * 100, 1),
+            "利確%": round(sum(x["why"] == "利確" for x in sub) / n * 100, 1),
+            "期限切れ%": round(sum(x["why"] == "期限切れ" for x in sub) / n * 100, 1)}
+
+
+def affordable(x):
+    """100株で資金内に収まり、100株の損切り損失が上限以内（実際に買える）"""
+    return x["buy"] * LOT <= CAPITAL and x["risk"] * LOT <= LOSS_LIMIT
+
+
 def summarize(trades, mood):
     rows = []
     for k, (label, _) in STRATEGIES.items():
         t = [x for x in trades if x["strategy"] == k]
         f = [x for x in t if x["filled"]]
-        row = {"条件": label, "シグナル": len(t), "約定": len(f)}
+        row = {"条件": label, "シグナル": len(t), "約定": len(f), "買える": {}}
         for tag, sub in (("全体", f), ("追い風", [x for x in f if mood.get(x["date"], False)]),
                          ("向かい風", [x for x in f if not mood.get(x["date"], True)])):
-            if not sub:
-                row[tag] = None
-                continue
-            r = pd.Series([x["r"] for x in sub])
-            row[tag] = {"件数": len(sub), "勝率": round((r > 0).mean() * 100, 1),
-                        "期待値R": round(r.mean(), 2),
-                        "平均損益%": round(pd.Series([x["ret"] for x in sub]).mean() * 100, 2),
-                        "平均日数": round(pd.Series([x["days"] for x in sub]).mean(), 1),
-                        "損切り%": round(sum(x["why"] == "損切り" for x in sub) / len(sub) * 100, 1),
-                        "利確%": round(sum(x["why"] == "利確" for x in sub) / len(sub) * 100, 1),
-                        "期限切れ%": round(sum(x["why"] == "期限切れ" for x in sub) / len(sub) * 100, 1)}
+            row[tag] = stats(sub)
+            row["買える"][tag] = stats([x for x in sub if affordable(x)])
         rows.append(row)
     return rows
 
@@ -113,6 +126,11 @@ def build(rows, n):
     for tag in ("全体", "追い風", "向かい風"):
         body += f"<h2>{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
         body += "".join(f"<tr><th>{r['条件']}</th>{cell(r[tag])}</tr>" for r in rows) + "</table></div>"
+    body += (f"<h1>買える銘柄だけ（100株が{CAPITAL // 10000}万円以内・損切り損失が{LOSS_LIMIT}円以内）</h1>"
+             "<p>実際の運用条件で買える取引だけに絞った成績。件数が少ない区分は参考程度に。</p>")
+    for tag in ("全体", "追い風", "向かい風"):
+        body += f"<h2>買える銘柄・{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
+        body += "".join(f"<tr><th>{r['条件']}</th>{cell(r['買える'][tag])}</tr>" for r in rows) + "</table></div>"
     page = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>過去検証</title>
 <link href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap" rel="stylesheet">
@@ -146,7 +164,7 @@ def main():
     rows = summarize(trades, mood)
     build(rows, len(data))
     for r in rows:
-        print(r["条件"], r["全体"])
+        print(r["条件"], r["全体"], r["買える"]["全体"])
 
 
 if __name__ == "__main__":
