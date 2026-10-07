@@ -16,10 +16,13 @@ JPX_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
 OUT = Path("docs")
 MIN_TURNOVER = 1e8   # 20日平均売買代金 1億円未満は除外
 MIN_RR = 1.0         # リスクリワード1未満は載せない
-TOP_N = 30           # 条件ごとの最大表示数
+TOP_N = 30           # 条件ごとの最大表示数（買える銘柄のみ）
 COUNCIL_N = 10       # エージェント協議に回す銘柄数
 MIN_EDGE = 0.1       # 過去検証の期待値Rがこれ未満の条件は、タブと協議候補から外す
 MIN_N = 100          # 過去検証の件数がこれ未満の区分は、外す・残すの判断に使わない（参考表示）
+CAPITAL = 100000    # 運用資金（円）
+LOSS_LIMIT = 2000   # 1銘柄の損失上限（円）＝資金の2%
+LOT = 100           # 売買単位（株）
 CHUNK = 100
 
 STRATEGIES = {
@@ -245,7 +248,7 @@ def screen(data, names):
                 s = f(d)
             except Exception:
                 s = None
-            if s:
+            if s and s["entry"] * LOT <= CAPITAL and (s["entry"] - s["stop"]) * LOT <= LOSS_LIMIT:  # 実際に買える銘柄だけ
                 s.update(code=t.replace(".T", ""), name=names.get(t, ""),
                          turnover=round((d["Close"] * d["Volume"]).iloc[-20:].mean() / 1e8, 1),
                          rsi=round(float(rsi(d["Close"]).iloc[-1]), 0))
@@ -328,6 +331,7 @@ def build_site(results, mood, council, keys, edge):
 <link href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap" rel="stylesheet"><style>{CSS}</style></head>
 <body><main><h1>スイング候補</h1><div class="date">{council['date']} 大引け時点・日足</div>
 <div class="mood {cls}"><b>地合い：{mood[0]}</b><br>{mood[1]}</div>
+{'' if council['candidates'] else '<div class="mood"><b>今日は買える候補なし</b><br>100株が10万円以内・損切り損失2,000円以内の銘柄が、残っている条件に見つかりませんでした。見送りです。</div>'}
 <nav>{''.join(nav)}</nav>{''.join(secs) or '<p class="empty">今の地合いで過去検証の成績が基準を満たす条件がありません。見送りが妥当です。</p>'}
 <footer>注文はIFDOCO（買い指値→利確・損切りを同時セット）を想定。表示は機械的な判定で、売買の判断はご自身で。</footer></main>
 <script>{JS}</script></body></html>"""
