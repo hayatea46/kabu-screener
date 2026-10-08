@@ -22,7 +22,7 @@ MIN_EDGE = 0.1       # 過去検証の期待値Rがこれ未満の条件は、�
 MIN_N = 100          # 過去検証の件数がこれ未満の区分は、外す・残すの判断に使わない（参考表示）
 CAPITAL = 100000    # 運用資金（円）
 LOSS_LIMIT = 2000   # 1銘柄の損失上限（円）＝資金の2%
-LOT = 100           # 売買単位（株）
+LOT = 1             # 売買単位（株）。1＝単元未満株（1株から）、100＝従来の100株単位
 CHUNK = 100
 
 STRATEGIES = {
@@ -212,7 +212,7 @@ def market_mood():
 
 def load_edge(mood):
     """docs/backtest.json から、条件ごとの期待値Rを返す（{条件名: {"r": R, "ref": 参考か}}）。
-    実際に買える銘柄（100株が資金内・損切り損失が上限内）の成績を使う。
+    実際に買える銘柄（LOT単位で1単位以上、資金内・損切り損失が上限内）の成績を使う。
     今の地合いの件数が MIN_N 未満なら「全体」に戻し、それも少なければ参考表示（判断に使わない）。
     ファイルが無い・読めない場合は空。古い形式（買える集計なし）は全銘柄の値で同じ判断をする。"""
     try:
@@ -238,6 +238,15 @@ def active(edge):
             if label not in edge or edge[label]["ref"] or edge[label]["r"] >= MIN_EDGE]
 
 
+def shares(entry, stop, lot=LOT):
+    """買える株数。損切り損失が LOSS_LIMIT 以内、買い代金が CAPITAL 以内になる最大株数（lot 単位で切り捨て）。0なら買えない"""
+    risk = entry - stop
+    if risk <= 0 or entry <= 0:
+        return 0
+    n = min(LOSS_LIMIT // risk, CAPITAL // entry)
+    return int(n // lot * lot)
+
+
 def screen(data, names):
     results = {k: [] for k in CHECKS}
     for t, d in data.items():
@@ -248,8 +257,8 @@ def screen(data, names):
                 s = f(d)
             except Exception:
                 s = None
-            if s and s["entry"] * LOT <= CAPITAL and (s["entry"] - s["stop"]) * LOT <= LOSS_LIMIT:  # 実際に買える銘柄だけ
-                s.update(code=t.replace(".T", ""), name=names.get(t, ""),
+            if s and shares(s["entry"], s["stop"]) > 0:  # 実際に買える銘柄だけ
+                s.update(shares=shares(s["entry"], s["stop"]), code=t.replace(".T", ""), name=names.get(t, ""),
                          turnover=round((d["Close"] * d["Volume"]).iloc[-20:].mean() / 1e8, 1),
                          rsi=round(float(rsi(d["Close"]).iloc[-1]), 0))
                 results[k].append(s)
@@ -265,7 +274,7 @@ def council_input(results, mood, keys):
     for r in pool:
         if r["code"] not in seen:
             seen.add(r["code"])
-            top.append({k: r[k] for k in ("code", "name", "strategy", "entry", "target", "stop", "rr", "rsi", "turnover", "note")})
+            top.append({k: r[k] for k in ("code", "name", "strategy", "entry", "target", "stop", "shares", "rr", "rsi", "turnover", "note")})
         if len(top) >= COUNCIL_N:
             break
     return {"date": str(dt.date.today()), "market": mood[0], "candidates": top}
@@ -309,7 +318,7 @@ def row_html(r):
     span = r["target"] - r["stop"]
     loss = (r["entry"] - r["stop"]) / span * 100
     return f"""<div class="row"><div class="head"><div><span class="code">{r['code']}</span><span class="name">{html.escape(r['name'])}</span></div>
-<div class="rr">{r['rr']}<small> RR</small></div></div><div class="note">{html.escape(r['note'])}／売買代金{r['turnover']}億円・RSI{r['rsi']:.0f}</div>
+<div class="rr">{r['rr']}<small> RR</small></div></div><div class="note">{html.escape(r['note'])}／{r['shares']:,}株まで（損失{(r['entry'] - r['stop']) * r['shares']:,.0f}円）・売買代金{r['turnover']}億円・RSI{r['rsi']:.0f}</div>
 <div class="ladder"><div class="r" style="left:0;width:{loss:.1f}%"></div><div class="g" style="left:{loss:.1f}%;right:0"></div></div>
 <div class="order"><div class="stop"><span>損切り</span>{r['stop']:,}円</div><div><span>買い指値</span>{r['entry']:,}円</div><div class="tgt"><span>利確</span>{r['target']:,}円</div></div></div>"""
 
@@ -331,7 +340,7 @@ def build_site(results, mood, council, keys, edge):
 <link href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap" rel="stylesheet"><style>{CSS}</style></head>
 <body><main><h1>スイング候補</h1><div class="date">{council['date']} 大引け時点・日足</div>
 <div class="mood {cls}"><b>地合い：{mood[0]}</b><br>{mood[1]}</div>
-{'' if council['candidates'] else '<div class="mood"><b>今日は買える候補なし</b><br>100株が10万円以内・損切り損失2,000円以内の銘柄が、残っている条件に見つかりませんでした。見送りです。</div>'}
+{'' if council['candidates'] else f'<div class="mood"><b>今日は買える候補なし</b><br>{LOT}株以上を{CAPITAL // 10000}万円以内・損切り損失{LOSS_LIMIT:,}円以内で買える銘柄が、残っている条件に見つかりませんでした。見送りです。</div>'}
 <nav>{''.join(nav)}</nav>{''.join(secs) or '<p class="empty">今の地合いで過去検証の成績が基準を満たす条件がありません。見送りが妥当です。</p>'}
 <footer>注文はIFDOCO（買い指値→利確・損切りを同時セット）を想定。表示は機械的な判定で、売買の判断はご自身で。</footer></main>
 <script>{JS}</script></body></html>"""

@@ -10,16 +10,13 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-from screener import CHECKS, MIN_TURNOVER, STRATEGIES, fetch, load_universe
+from screener import CAPITAL, CHECKS, LOSS_LIMIT, LOT, MIN_TURNOVER, STRATEGIES, fetch, load_universe, shares
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
 YEARS = 6           # 検証期間
 MAX_HOLD = 30       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
-CAPITAL = 100000    # 運用資金（円）
-LOSS_LIMIT = 2000   # 1銘柄の損失上限（円）＝資金の2%
-LOT = 100           # 売買単位（株）
 
 
 def mood_series():
@@ -92,9 +89,9 @@ def stats(sub):
             "期限切れ%": round(sum(x["why"] == "期限切れ" for x in sub) / n * 100, 1)}
 
 
-def affordable(x):
-    """100株で資金内に収まり、100株の損切り損失が上限以内（実際に買える）"""
-    return x["buy"] * LOT <= CAPITAL and x["risk"] * LOT <= LOSS_LIMIT
+def affordable(x, lot=LOT):
+    """lot株単位で1単位以上、資金内・損切り損失が上限以内で買える（実際に買える）"""
+    return shares(x["buy"], x["buy"] - x["risk"], lot) > 0
 
 
 def summarize(trades, mood):
@@ -102,11 +99,12 @@ def summarize(trades, mood):
     for k, (label, _) in STRATEGIES.items():
         t = [x for x in trades if x["strategy"] == k]
         f = [x for x in t if x["filled"]]
-        row = {"条件": label, "シグナル": len(t), "約定": len(f), "買える": {}}
+        row = {"条件": label, "シグナル": len(t), "約定": len(f), "買える": {}, "100株単位": {}}
         for tag, sub in (("全体", f), ("追い風", [x for x in f if mood.get(x["date"], False)]),
                          ("向かい風", [x for x in f if not mood.get(x["date"], True)])):
             row[tag] = stats(sub)
             row["買える"][tag] = stats([x for x in sub if affordable(x)])
+            row["100株単位"][tag] = stats([x for x in sub if affordable(x, 100)])
         rows.append(row)
     return rows
 
@@ -126,11 +124,13 @@ def build(rows, n):
     for tag in ("全体", "追い風", "向かい風"):
         body += f"<h2>{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
         body += "".join(f"<tr><th>{r['条件']}</th>{cell(r[tag])}</tr>" for r in rows) + "</table></div>"
-    body += (f"<h1>買える銘柄だけ（100株が{CAPITAL // 10000}万円以内・損切り損失が{LOSS_LIMIT}円以内）</h1>"
-             "<p>実際の運用条件で買える取引だけに絞った成績。件数が少ない区分は参考程度に。</p>")
-    for tag in ("全体", "追い風", "向かい風"):
-        body += f"<h2>買える銘柄・{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
-        body += "".join(f"<tr><th>{r['条件']}</th>{cell(r['買える'][tag])}</tr>" for r in rows) + "</table></div>"
+    for key, lot, note in (("買える", LOT, "今の運用条件。サイトの条件の外す・残すはこの成績で決める"),
+                           ("100株単位", 100, "比較用（従来の100株単位）")):
+        body += (f"<h1>買える銘柄だけ（{lot}株単位・{CAPITAL // 10000}万円以内・損切り損失{LOSS_LIMIT:,}円以内）</h1>"
+                 f"<p>{note}。件数が少ない区分は参考程度に。</p>")
+        for tag in ("全体", "追い風", "向かい風"):
+            body += f"<h2>{lot}株単位・{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
+            body += "".join(f"<tr><th>{r['条件']}</th>{cell(r[key].get(tag))}</tr>" for r in rows) + "</table></div>"
     page = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>過去検証</title>
 <link href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap" rel="stylesheet">
