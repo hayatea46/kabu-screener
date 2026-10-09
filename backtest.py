@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TURNOVER, STRATEGIES, day_range, fetch, load_universe, shares
+from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TURNOVER, STRATEGIES, day_range, fetch, load_universe, shares, similar_lookup
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
 YEARS = 6           # 検証期間
@@ -205,14 +205,6 @@ def similar_table(t):
                 table["|".join(map(str, key))] = {"件数": len(g), "勝率": round((g["r"] > 0).mean() * 100, 1),
                                                   "実効R": round(g["eff"].mean(), 3)}
     return {"edges": edges, "table": table}
-
-
-def similar_lookup(model, strategy, width, mood):
-    band = sum(width > e for e in model["edges"])
-    for key in (f"{strategy}|{band}|{mood}", f"{strategy}|{band}", strategy):
-        if key in model["table"]:
-            return model["table"][key]
-    return None
 
 
 def portfolio(trades, mood):
