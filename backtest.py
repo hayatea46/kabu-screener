@@ -68,6 +68,17 @@ def simulate_open(d, i, s):
                 "why": why or "期限切れ", "buy": buy, "risk": risk, "rule": "寄付"}
 
 
+def features(win, s):
+    """シグナル時点で分かる特徴（大負けの傾向分析用）"""
+    c, v = win["Close"], win["Volume"]
+    return {"損切り幅%": (s["entry"] - s["stop"]) / s["entry"] * 100,
+            "値動きの荒さ%": ((win["High"] - win["Low"]) / c).iloc[-14:].mean() * 100,
+            "25日線との差%": (c.iloc[-1] / c.iloc[-25:].mean() - 1) * 100,
+            "直近5日の騰落%": (c.iloc[-1] / c.iloc[-6] - 1) * 100,
+            "出来高倍率": v.iloc[-1] / max(v.iloc[-21:-1].mean(), 1),
+            "株価": c.iloc[-1]}
+
+
 def run_stock(args):
     d, start = args
     trades = []
@@ -91,7 +102,7 @@ def run_stock(args):
                 res = sim(d, i, s)
                 if res is None:
                     continue
-                res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"])
+                res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"], **features(win, s))
                 trades.append(res)
                 if res["filled"]:
                     busy[k, rule] = res["exit"]
@@ -150,7 +161,30 @@ def cell(v):
             f"<td>{v['1.5R超%']}%</td><td>{v['2R超%']}%</td><td>{v['超過95%']}%</td>")
 
 
-def build(rows, n):
+def bigloss(trades, mood):
+    """大負け（損失上限の1.5倍超）の傾向：特徴ごとに5段階に分けて、大負けの割合を比べる"""
+    html = ("<h1>大負けしやすい特徴（1株単位で買える取引）</h1><p>買う時点で分かる特徴を、小さい順に5つの組に同数ずつ分け、"
+            "各組で損失上限の1.5倍を超えて負けた割合（大負け率）と期待値Rを比べた表。大負け率が高く期待値Rが低い組は避ける候補。</p>")
+    for rule, title in (("寄付", "会社員ルール"), ("指値", "指値＋逆指値")):
+        t = pd.DataFrame([x for x in trades if x["rule"] == rule and x["filled"] and affordable(x)])
+        if t.empty:
+            continue
+        t["big"] = t["r"] < -1.5
+        t["地合い"] = t["date"].map(lambda d: "追い風" if mood.get(d, False) else "向かい風")
+        html += f"<h2>{title}（全体の大負け率 {t['big'].mean() * 100:.1f}%）</h2><div class=w><table>"
+        html += "<tr><th>特徴</th><th>組</th><th>範囲</th><th>件数</th><th>大負け率</th><th>期待値R</th></tr>"
+        for col in ("損切り幅%", "値動きの荒さ%", "25日線との差%", "直近5日の騰落%", "出来高倍率", "株価", "地合い"):
+            g = t.groupby(t[col] if col == "地合い" else pd.qcut(t[col], 5, duplicates="drop"), observed=True)
+            for j, (key, sub) in enumerate(g):
+                rng = key if col == "地合い" else f"{key.left:.1f}〜{key.right:.1f}"
+                cls = " class=bad" if sub["big"].mean() > t["big"].mean() * 1.5 else ""
+                html += (f"<tr><th>{col if j == 0 else ''}</th><td>{j + 1}</td><td>{rng}</td><td>{len(sub)}</td>"
+                         f"<td{cls}>{sub['big'].mean() * 100:.1f}%</td><td>{sub['r'].mean():+.2f}</td></tr>")
+        html += "</table></div>"
+    return html
+
+
+def build(rows, n, extra=""):
     head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th><th>最悪R</th><th>1.5R超</th><th>2R超</th><th>損切り超過95%</th>"
     body = ""
     for tag in ("全体", "追い風", "向かい風"):
@@ -169,6 +203,7 @@ def build(rows, n):
     for tag in ("全体", "追い風", "向かい風"):
         body += f"<h2>会社員ルール・{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
         body += "".join(f"<tr><th>{r['条件']}</th>{cell(r['寄付成行'].get(tag))}</tr>" for r in rows) + "</table></div>"
+    body += extra
     page = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>過去検証</title>
 <link href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap" rel="stylesheet">
@@ -201,7 +236,7 @@ def main():
     with Pool() as p:
         trades = [x for ts in p.map(run_stock, jobs) for x in ts]
     rows = summarize(trades, mood)
-    build(rows, len(data))
+    build(rows, len(data), bigloss(trades, mood))
     for r in rows:
         print(r["条件"], r["全体"], r["買える"]["全体"])
 
