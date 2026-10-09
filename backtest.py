@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-from screener import CAPITAL, CHECKS, LOSS_LIMIT, LOT, MIN_TURNOVER, STRATEGIES, fetch, load_universe, shares
+from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TURNOVER, STRATEGIES, day_range, fetch, load_universe, shares
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
 YEARS = 6           # 検証期間
@@ -68,13 +68,24 @@ def simulate_open(d, i, s):
                 "why": why or "期限切れ", "buy": buy, "risk": risk, "rule": "寄付"}
 
 
+def features(win, s):
+    """シグナル時点で分かる特徴（大負けの傾向分析用）"""
+    c, v = win["Close"], win["Volume"]
+    return {"損切り幅%": (s["entry"] - s["stop"]) / s["entry"] * 100,
+            "値動きの荒さ%": ((win["High"] - win["Low"]) / c).iloc[-14:].mean() * 100,
+            "25日線との差%": (c.iloc[-1] / c.iloc[-25:].mean() - 1) * 100,
+            "直近5日の騰落%": (c.iloc[-1] / c.iloc[-6] - 1) * 100,
+            "出来高倍率": v.iloc[-1] / max(v.iloc[-21:-1].mean(), 1),
+            "株価": c.iloc[-1]}
+
+
 def run_stock(args):
     d, start = args
     trades = []
     busy = {(k, rule): -1 for k in CHECKS for rule in ("指値", "寄付")}
     for i in range(max(start, WINDOW), len(d) - 1):
         win = d.iloc[i - WINDOW + 1:i + 1]
-        if (win["Close"] * win["Volume"]).iloc[-20:].mean() < MIN_TURNOVER:
+        if (win["Close"] * win["Volume"]).iloc[-20:].mean() < MIN_TURNOVER or day_range(win) > MAX_RANGE:
             continue
         for k, f in CHECKS.items():
             if i <= busy[k, "指値"] and i <= busy[k, "寄付"]:
@@ -91,7 +102,7 @@ def run_stock(args):
                 res = sim(d, i, s)
                 if res is None:
                     continue
-                res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"])
+                res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"], **features(win, s))
                 trades.append(res)
                 if res["filled"]:
                     busy[k, rule] = res["exit"]
@@ -105,6 +116,7 @@ def stats(sub):
     n = len(sub)
     return {"件数": n, "勝率": round((r > 0).mean() * 100, 1),
             "期待値R": round(r.mean(), 2),
+            "実効R": round(pd.Series([x["ret"] * x["buy"] / (x["risk"] + x["buy"] * BUFFER) for x in sub]).mean(), 2),
             "平均損益%": round(pd.Series([x["ret"] for x in sub]).mean() * 100, 2),
             "平均日数": round(pd.Series([x["days"] for x in sub]).mean(), 1),
             "損切り%": round(sum(x["why"] == "損切り" for x in sub) / n * 100, 1),
@@ -142,16 +154,39 @@ def summarize(trades, mood):
 
 def cell(v):
     if not v:
-        return "<td colspan=12>なし</td>"
+        return "<td colspan=13>なし</td>"
     good = "good" if v["期待値R"] > 0.1 else "bad" if v["期待値R"] < 0 else ""
-    return (f"<td>{v['件数']}</td><td>{v['勝率']}%</td><td class='{good}'>{v['期待値R']:+.2f}</td>"
+    return (f"<td>{v['件数']}</td><td>{v['勝率']}%</td><td class='{good}'>{v['期待値R']:+.2f}</td><td>{v['実効R']:+.2f}</td>"
             f"<td>{v['平均損益%']:+.2f}%</td><td>{v['平均日数']}</td>"
             f"<td>{v['損切り%']}%</td><td>{v['利確%']}%</td><td>{v['期限切れ%']}%</td><td>{v['最悪R']:+.2f}</td>"
             f"<td>{v['1.5R超%']}%</td><td>{v['2R超%']}%</td><td>{v['超過95%']}%</td>")
 
 
-def build(rows, n):
-    head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th><th>最悪R</th><th>1.5R超</th><th>2R超</th><th>損切り超過95%</th>"
+def bigloss(trades, mood):
+    """大負け（損失上限の1.5倍超）の傾向：特徴ごとに5段階に分けて、大負けの割合を比べる"""
+    html = ("<h1>大負けしやすい特徴（1株単位で買える取引）</h1><p>買う時点で分かる特徴を、小さい順に5つの組に同数ずつ分け、"
+            "各組で損失上限の1.5倍を超えて負けた割合（大負け率）と期待値Rを比べた表。大負け率が高く期待値Rが低い組は避ける候補。</p>")
+    for rule, title in (("寄付", "会社員ルール"), ("指値", "指値＋逆指値")):
+        t = pd.DataFrame([x for x in trades if x["rule"] == rule and x["filled"] and affordable(x)])
+        if t.empty:
+            continue
+        t["big"] = t["r"] < -1.5
+        t["地合い"] = t["date"].map(lambda d: "追い風" if mood.get(d, False) else "向かい風")
+        html += f"<h2>{title}（全体の大負け率 {t['big'].mean() * 100:.1f}%）</h2><div class=w><table>"
+        html += "<tr><th>特徴</th><th>組</th><th>範囲</th><th>件数</th><th>大負け率</th><th>期待値R</th></tr>"
+        for col in ("損切り幅%", "値動きの荒さ%", "25日線との差%", "直近5日の騰落%", "出来高倍率", "株価", "地合い"):
+            g = t.groupby(t[col] if col == "地合い" else pd.qcut(t[col], 5, duplicates="drop"), observed=True)
+            for j, (key, sub) in enumerate(g):
+                rng = key if col == "地合い" else f"{key.left:.1f}〜{key.right:.1f}"
+                cls = " class=bad" if sub["big"].mean() > t["big"].mean() * 1.5 else ""
+                html += (f"<tr><th>{col if j == 0 else ''}</th><td>{j + 1}</td><td>{rng}</td><td>{len(sub)}</td>"
+                         f"<td{cls}>{sub['big'].mean() * 100:.1f}%</td><td>{sub['r'].mean():+.2f}</td></tr>")
+        html += "</table></div>"
+    return html
+
+
+def build(rows, n, extra=""):
+    head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>実効R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th><th>最悪R</th><th>1.5R超</th><th>2R超</th><th>損切り超過95%</th>"
     body = ""
     for tag in ("全体", "追い風", "向かい風"):
         body += f"<h2>{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
@@ -169,6 +204,7 @@ def build(rows, n):
     for tag in ("全体", "追い風", "向かい風"):
         body += f"<h2>会社員ルール・{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
         body += "".join(f"<tr><th>{r['条件']}</th>{cell(r['寄付成行'].get(tag))}</tr>" for r in rows) + "</table></div>"
+    body += extra
     page = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>過去検証</title>
 <link href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap" rel="stylesheet">
@@ -179,7 +215,7 @@ th,td{{border:1px solid #D5DBD9;padding:6px 8px;text-align:right;white-space:now
 .good{{color:#C62E2E;font-weight:700}}.bad{{color:#2A5DA8;font-weight:700}}p{{color:#66706E;font-size:.85rem}}</style></head>
 <body><main><h1>過去{YEARS}年の検証（{n}銘柄）</h1>
 <p>期待値Rは「1回の取引で、損切り幅の何倍を平均で稼げたか」。+0.1以上が実用の目安、マイナスは使わない方がよい条件。
-損切り・利確・期限切れは決済理由の割合（期限切れは最大保有日数で引け売り）。最悪Rは一番大きく負けた取引（-1より小さいと損失上限超え）。1.5R超・2R超は損失上限の1.5倍・2倍を超えて負けた取引の割合。
+損切り・利確・期限切れは決済理由の割合（期限切れは最大保有日数で引け売り）。実効Rは余裕幅（株価の{BUFFER:.0%}）込みで株数を決めたときの、損失上限（2,000円）あたりの平均損益。値動きの荒い銘柄（1日の値幅の平均が{MAX_RANGE}%超）は除外。最悪Rは一番大きく負けた取引（-1より小さいと損失上限超え）。1.5R超・2R超は損失上限の1.5倍・2倍を超えて負けた取引の割合。
 損切り超過95%は、損切りした取引の95%が「損切り価格から株価の何%以内の下で売れたか」で、株数計算の余裕幅の目安。翌日に指値が約定した取引のみ集計（会社員ルールを除く）。同日に損切りと利確の両方に届いた日は損切り扱い。</p>{body}
 <p>注意：現在上場している銘柄だけで検証しているため、実際より成績がやや良く出る傾向があります。</p></main></body></html>"""
     OUT.mkdir(exist_ok=True)
@@ -201,7 +237,7 @@ def main():
     with Pool() as p:
         trades = [x for ts in p.map(run_stock, jobs) for x in ts]
     rows = summarize(trades, mood)
-    build(rows, len(data))
+    build(rows, len(data), bigloss(trades, mood))
     for r in rows:
         print(r["条件"], r["全体"], r["買える"]["全体"])
 
