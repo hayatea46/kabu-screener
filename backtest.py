@@ -91,7 +91,7 @@ def run_stock(args):
                 res = sim(d, i, s)
                 if res is None:
                     continue
-                res.update(strategy=k, date=d.index[i], rule=rule)
+                res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"])
                 trades.append(res)
                 if res["filled"]:
                     busy[k, rule] = res["exit"]
@@ -110,7 +110,10 @@ def stats(sub):
             "損切り%": round(sum(x["why"] == "損切り" for x in sub) / n * 100, 1),
             "利確%": round(sum(x["why"] == "利確" for x in sub) / n * 100, 1),
             "期限切れ%": round(sum(x["why"] == "期限切れ" for x in sub) / n * 100, 1),
-            "最悪R": round(r.min(), 2)}
+            "最悪R": round(r.min(), 2),
+            "1.5R超%": round((r < -1.5).mean() * 100, 1), "2R超%": round((r < -2).mean() * 100, 1),
+            "超過95%": round(pd.Series([max(0, x["stop"] - x["buy"] * (1 + x["ret"])) / x["stop"]
+                                        for x in sub if x["why"] == "損切り"] or [0]).quantile(.95) * 100, 1)}
 
 
 def affordable(x, lot=LOT):
@@ -139,15 +142,16 @@ def summarize(trades, mood):
 
 def cell(v):
     if not v:
-        return "<td colspan=9>なし</td>"
+        return "<td colspan=12>なし</td>"
     good = "good" if v["期待値R"] > 0.1 else "bad" if v["期待値R"] < 0 else ""
     return (f"<td>{v['件数']}</td><td>{v['勝率']}%</td><td class='{good}'>{v['期待値R']:+.2f}</td>"
             f"<td>{v['平均損益%']:+.2f}%</td><td>{v['平均日数']}</td>"
-            f"<td>{v['損切り%']}%</td><td>{v['利確%']}%</td><td>{v['期限切れ%']}%</td><td>{v['最悪R']:+.2f}</td>")
+            f"<td>{v['損切り%']}%</td><td>{v['利確%']}%</td><td>{v['期限切れ%']}%</td><td>{v['最悪R']:+.2f}</td>"
+            f"<td>{v['1.5R超%']}%</td><td>{v['2R超%']}%</td><td>{v['超過95%']}%</td>")
 
 
 def build(rows, n):
-    head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th><th>最悪R</th>"
+    head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th><th>最悪R</th><th>1.5R超</th><th>2R超</th><th>損切り超過95%</th>"
     body = ""
     for tag in ("全体", "追い風", "向かい風"):
         body += f"<h2>{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
@@ -175,7 +179,8 @@ th,td{{border:1px solid #D5DBD9;padding:6px 8px;text-align:right;white-space:now
 .good{{color:#C62E2E;font-weight:700}}.bad{{color:#2A5DA8;font-weight:700}}p{{color:#66706E;font-size:.85rem}}</style></head>
 <body><main><h1>過去{YEARS}年の検証（{n}銘柄）</h1>
 <p>期待値Rは「1回の取引で、損切り幅の何倍を平均で稼げたか」。+0.1以上が実用の目安、マイナスは使わない方がよい条件。
-損切り・利確・期限切れは決済理由の割合（期限切れは最大保有日数で引け売り）。最悪Rは一番大きく負けた取引（-1より小さいと損失上限超え）。翌日に指値が約定した取引のみ集計（会社員ルールを除く）。同日に損切りと利確の両方に届いた日は損切り扱い。</p>{body}
+損切り・利確・期限切れは決済理由の割合（期限切れは最大保有日数で引け売り）。最悪Rは一番大きく負けた取引（-1より小さいと損失上限超え）。1.5R超・2R超は損失上限の1.5倍・2倍を超えて負けた取引の割合。
+損切り超過95%は、損切りした取引の95%が「損切り価格から株価の何%以内の下で売れたか」で、株数計算の余裕幅の目安。翌日に指値が約定した取引のみ集計（会社員ルールを除く）。同日に損切りと利確の両方に届いた日は損切り扱い。</p>{body}
 <p>注意：現在上場している銘柄だけで検証しているため、実際より成績がやや良く出る傾向があります。</p></main></body></html>"""
     OUT.mkdir(exist_ok=True)
     (OUT / "backtest.html").write_text(page, encoding="utf-8")
