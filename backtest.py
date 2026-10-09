@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-from screener import CAPITAL, CHECKS, LOSS_LIMIT, LOT, MIN_TURNOVER, STRATEGIES, fetch, load_universe, shares
+from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TURNOVER, STRATEGIES, day_range, fetch, load_universe, shares
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
 YEARS = 6           # 検証期間
@@ -85,7 +85,7 @@ def run_stock(args):
     busy = {(k, rule): -1 for k in CHECKS for rule in ("指値", "寄付")}
     for i in range(max(start, WINDOW), len(d) - 1):
         win = d.iloc[i - WINDOW + 1:i + 1]
-        if (win["Close"] * win["Volume"]).iloc[-20:].mean() < MIN_TURNOVER:
+        if (win["Close"] * win["Volume"]).iloc[-20:].mean() < MIN_TURNOVER or day_range(win) > MAX_RANGE:
             continue
         for k, f in CHECKS.items():
             if i <= busy[k, "指値"] and i <= busy[k, "寄付"]:
@@ -116,6 +116,7 @@ def stats(sub):
     n = len(sub)
     return {"件数": n, "勝率": round((r > 0).mean() * 100, 1),
             "期待値R": round(r.mean(), 2),
+            "実効R": round(pd.Series([x["ret"] * x["buy"] / (x["risk"] + x["buy"] * BUFFER) for x in sub]).mean(), 2),
             "平均損益%": round(pd.Series([x["ret"] for x in sub]).mean() * 100, 2),
             "平均日数": round(pd.Series([x["days"] for x in sub]).mean(), 1),
             "損切り%": round(sum(x["why"] == "損切り" for x in sub) / n * 100, 1),
@@ -153,9 +154,9 @@ def summarize(trades, mood):
 
 def cell(v):
     if not v:
-        return "<td colspan=12>なし</td>"
+        return "<td colspan=13>なし</td>"
     good = "good" if v["期待値R"] > 0.1 else "bad" if v["期待値R"] < 0 else ""
-    return (f"<td>{v['件数']}</td><td>{v['勝率']}%</td><td class='{good}'>{v['期待値R']:+.2f}</td>"
+    return (f"<td>{v['件数']}</td><td>{v['勝率']}%</td><td class='{good}'>{v['期待値R']:+.2f}</td><td>{v['実効R']:+.2f}</td>"
             f"<td>{v['平均損益%']:+.2f}%</td><td>{v['平均日数']}</td>"
             f"<td>{v['損切り%']}%</td><td>{v['利確%']}%</td><td>{v['期限切れ%']}%</td><td>{v['最悪R']:+.2f}</td>"
             f"<td>{v['1.5R超%']}%</td><td>{v['2R超%']}%</td><td>{v['超過95%']}%</td>")
@@ -185,7 +186,7 @@ def bigloss(trades, mood):
 
 
 def build(rows, n, extra=""):
-    head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th><th>最悪R</th><th>1.5R超</th><th>2R超</th><th>損切り超過95%</th>"
+    head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>実効R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th><th>最悪R</th><th>1.5R超</th><th>2R超</th><th>損切り超過95%</th>"
     body = ""
     for tag in ("全体", "追い風", "向かい風"):
         body += f"<h2>{tag}</h2><div class=w><table><tr><th>条件</th>{head}</tr>"
@@ -214,7 +215,7 @@ th,td{{border:1px solid #D5DBD9;padding:6px 8px;text-align:right;white-space:now
 .good{{color:#C62E2E;font-weight:700}}.bad{{color:#2A5DA8;font-weight:700}}p{{color:#66706E;font-size:.85rem}}</style></head>
 <body><main><h1>過去{YEARS}年の検証（{n}銘柄）</h1>
 <p>期待値Rは「1回の取引で、損切り幅の何倍を平均で稼げたか」。+0.1以上が実用の目安、マイナスは使わない方がよい条件。
-損切り・利確・期限切れは決済理由の割合（期限切れは最大保有日数で引け売り）。最悪Rは一番大きく負けた取引（-1より小さいと損失上限超え）。1.5R超・2R超は損失上限の1.5倍・2倍を超えて負けた取引の割合。
+損切り・利確・期限切れは決済理由の割合（期限切れは最大保有日数で引け売り）。実効Rは余裕幅（株価の{BUFFER:.0%}）込みで株数を決めたときの、損失上限（2,000円）あたりの平均損益。値動きの荒い銘柄（1日の値幅の平均が{MAX_RANGE}%超）は除外。最悪Rは一番大きく負けた取引（-1より小さいと損失上限超え）。1.5R超・2R超は損失上限の1.5倍・2倍を超えて負けた取引の割合。
 損切り超過95%は、損切りした取引の95%が「損切り価格から株価の何%以内の下で売れたか」で、株数計算の余裕幅の目安。翌日に指値が約定した取引のみ集計（会社員ルールを除く）。同日に損切りと利確の両方に届いた日は損切り扱い。</p>{body}
 <p>注意：現在上場している銘柄だけで検証しているため、実際より成績がやや良く出る傾向があります。</p></main></body></html>"""
     OUT.mkdir(exist_ok=True)

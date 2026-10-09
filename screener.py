@@ -23,6 +23,8 @@ MIN_N = 100          # 過去検証の件数がこれ未満の区分は、外す
 CAPITAL = 100000    # 運用資金（円）
 LOSS_LIMIT = 2000   # 1銘柄の損失上限（円）＝資金の2%
 LOT = 1             # 売買単位（株）。1＝単元未満株（1株から）、100＝従来の100株単位
+BUFFER = 0.07       # 損切りが翌朝の寄付になって遅れる分の余裕（株価の7%）。株数計算で損切り幅に足す
+MAX_RANGE = 3.7     # 直近14日の1日の値幅の平均（株価の%）がこれを超える荒い銘柄は除外
 CHUNK = 100
 
 STRATEGIES = {
@@ -212,7 +214,7 @@ def market_mood():
 
 def load_edge(mood):
     """docs/backtest.json から、条件ごとの期待値Rを返す（{条件名: {"r": R, "ref": 参考か}}）。
-    実際に買える銘柄（LOT単位で1単位以上、資金内・損切り損失が上限内）の成績を使う。
+    会社員ルール（翌朝寄付の成行で売買）で実際に買える銘柄の成績を使う。無ければ指値ルールの買える銘柄の成績。
     今の地合いの件数が MIN_N 未満なら「全体」に戻し、それも少なければ参考表示（判断に使わない）。
     ファイルが無い・読めない場合は空。古い形式（買える集計なし）は全銘柄の値で同じ判断をする。"""
     try:
@@ -221,7 +223,7 @@ def load_edge(mood):
         return {}
     edge = {}
     for r in rows:
-        src = r.get("買える") or {t: r.get(t) for t in ("全体", "追い風", "向かい風")}
+        src = r.get("寄付成行") or r.get("買える") or {t: r.get(t) for t in ("全体", "追い風", "向かい風")}
         order = [mood[0], "全体"] if mood[0] in ("追い風", "向かい風") else ["全体"]
         cands = [src.get(t) for t in order if src.get(t) and "期待値R" in src[t]]
         enough = [v for v in cands if v["件数"] >= MIN_N]
@@ -239,18 +241,22 @@ def active(edge):
 
 
 def shares(entry, stop, lot=LOT):
-    """買える株数。損切り損失が LOSS_LIMIT 以内、買い代金が CAPITAL 以内になる最大株数（lot 単位で切り捨て）。0なら買えない"""
-    risk = entry - stop
-    if risk <= 0 or entry <= 0:
+    """買える株数。損切り幅＋余裕（株価×BUFFER）での損失が LOSS_LIMIT 以内、買い代金が CAPITAL 以内になる最大株数（lot 単位で切り捨て）。0なら買えない"""
+    if entry - stop <= 0 or entry <= 0:
         return 0
-    n = min(LOSS_LIMIT // risk, CAPITAL // entry)
+    n = min(LOSS_LIMIT // (entry - stop + entry * BUFFER), CAPITAL // entry)
     return int(n // lot * lot)
+
+
+def day_range(d):
+    """直近14日の1日の値幅（高値−安値）の平均。株価の%"""
+    return float(((d["High"] - d["Low"]) / d["Close"]).iloc[-14:].mean() * 100)
 
 
 def screen(data, names):
     results = {k: [] for k in CHECKS}
     for t, d in data.items():
-        if (d["Close"] * d["Volume"]).iloc[-20:].mean() < MIN_TURNOVER:
+        if (d["Close"] * d["Volume"]).iloc[-20:].mean() < MIN_TURNOVER or day_range(d) > MAX_RANGE:
             continue
         for k, f in CHECKS.items():
             try:
