@@ -248,12 +248,29 @@ def shares(entry, stop, lot=LOT):
     return int(n // lot * lot)
 
 
+def load_similar():
+    """docs/similar.json（backtest.py が作る「似た取引」の成績表）。無ければ None"""
+    try:
+        return json.loads((OUT / "similar.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def similar_lookup(model, strategy, width, mood):
+    """条件×損切り幅（株価の%）×地合いが似た過去の取引の成績 {"件数","勝率","実効R"}。件数が少なければ区分を粗くする"""
+    band = sum(width > e for e in model["edges"])
+    for key in (f"{strategy}|{band}|{mood}", f"{strategy}|{band}", strategy):
+        if key in model["table"]:
+            return model["table"][key]
+    return None
+
+
 def day_range(d):
     """直近14日の1日の値幅（高値−安値）の平均。株価の%"""
     return float(((d["High"] - d["Low"]) / d["Close"]).iloc[-14:].mean() * 100)
 
 
-def screen(data, names):
+def screen(data, names, mood=("不明",), model=None):
     results = {k: [] for k in CHECKS}
     for t, d in data.items():
         if (d["Close"] * d["Volume"]).iloc[-20:].mean() < MIN_TURNOVER or day_range(d) > MAX_RANGE:
@@ -267,20 +284,24 @@ def screen(data, names):
                 s.update(shares=shares(s["entry"], s["stop"]), code=t.replace(".T", ""), name=names.get(t, ""),
                          turnover=round((d["Close"] * d["Volume"]).iloc[-20:].mean() / 1e8, 1),
                          rsi=round(float(rsi(d["Close"]).iloc[-1]), 0))
+                h = model and similar_lookup(model, k, (s["entry"] - s["stop"]) / s["entry"] * 100, mood[0])
+                if h:  # 期待値は損失上限あたり（余裕幅込みの株数）で1回平均何円残るか
+                    s.update(similar_n=h["件数"], win_pct=h["勝率"], ev_yen=round(h["実効R"] * LOSS_LIMIT))
                 results[k].append(s)
-    for k in results:
-        results[k] = sorted(results[k], key=lambda x: -x["rr"])[:TOP_N]
+    for k in results:  # 似た取引の期待値が高い順（無ければリスクリワード順）
+        results[k] = sorted(results[k], key=lambda x: (-x.get("ev_yen", -1e9), -x["rr"]))[:TOP_N]
     return results
 
 
 def council_input(results, mood, keys):
     pool = [dict(r, strategy=STRATEGIES[k][0]) for k in keys for r in results[k]]
-    pool = sorted(pool, key=lambda x: -x["rr"])
+    pool = sorted(pool, key=lambda x: (-x.get("ev_yen", -1e9), -x["rr"]))
     seen, top = set(), []
     for r in pool:
         if r["code"] not in seen:
             seen.add(r["code"])
-            top.append({k: r[k] for k in ("code", "name", "strategy", "entry", "target", "stop", "shares", "rr", "rsi", "turnover", "note")})
+            top.append({k: r[k] for k in ("code", "name", "strategy", "entry", "target", "stop", "shares", "rr", "rsi", "turnover", "note")}
+                       | {k: r[k] for k in ("similar_n", "win_pct", "ev_yen") if k in r})
         if len(top) >= COUNCIL_N:
             break
     return {"date": str(dt.date.today()), "market": mood[0], "candidates": top}
@@ -325,8 +346,9 @@ def row_html(r):
     loss = (r["entry"] - r["stop"]) / span * 100
     return f"""<div class="row"><div class="head"><div><span class="code">{r['code']}</span><span class="name">{html.escape(r['name'])}</span></div>
 <div class="rr">{r['rr']}<small> RR</small></div></div><div class="note">{html.escape(r['note'])}／{r['shares']:,}株まで（損失{(r['entry'] - r['stop']) * r['shares']:,.0f}円）・売買代金{r['turnover']}億円・RSI{r['rsi']:.0f}</div>
+{f'<div class="note">似た取引{r["similar_n"]:,}件：勝率{r["win_pct"]:.0f}%・1回平均{r["ev_yen"]:+,}円</div>' if "ev_yen" in r else ""}
 <div class="ladder"><div class="r" style="left:0;width:{loss:.1f}%"></div><div class="g" style="left:{loss:.1f}%;right:0"></div></div>
-<div class="order"><div class="stop"><span>損切り</span>{r['stop']:,}円</div><div><span>買い指値</span>{r['entry']:,}円</div><div class="tgt"><span>利確</span>{r['target']:,}円</div></div></div>"""
+<div class="order"><div class="stop"><span>損切り</span>{r['stop']:,}円</div><div><span>買値の目安</span>{r['entry']:,}円</div><div class="tgt"><span>利確</span>{r['target']:,}円</div></div></div>"""
 
 
 def build_site(results, mood, council, keys, edge):
@@ -360,7 +382,7 @@ def main():
     data = fetch(list(names))
     print(f"取得 {len(data)} 銘柄")
     mood = market_mood()
-    results = screen(data, names)
+    results = screen(data, names, mood, load_similar())
     edge = load_edge(mood)
     keys = active(edge)
     print(f"地合い {mood[0]} / 期待値R {edge} / 残す条件 {[STRATEGIES[k][0] for k in keys]}")
