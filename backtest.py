@@ -16,7 +16,7 @@ from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TU
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
 YEARS = 6           # 検証期間
-MAX_HOLD = 20       # 最大保有営業日
+MAX_HOLD = 15       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
 
