@@ -80,7 +80,7 @@ def features(win, s):
 
 
 def run_stock(args):
-    d, start = args
+    d, start, code = args
     trades = []
     busy = {(k, rule): -1 for k in CHECKS for rule in ("指値", "寄付")}
     for i in range(max(start, WINDOW), len(d) - 1):
@@ -102,7 +102,9 @@ def run_stock(args):
                 res = sim(d, i, s)
                 if res is None:
                     continue
-                res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"], **features(win, s))
+                res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"], rr=s["rr"], code=code, **features(win, s))
+                if res["filled"]:
+                    res.update(buy_date=d.index[i + 1], exit_date=d.index[res["exit"]])
                 trades.append(res)
                 if res["filled"]:
                     busy[k, rule] = res["exit"]
@@ -185,6 +187,95 @@ def bigloss(trades, mood):
     return html
 
 
+MIN_SIMILAR = 30    # 似た取引がこれ未満なら、区分を粗くして数え直す
+MAX_POS = 3         # 運用シミュレーション：同時に持つ最大銘柄数
+NEW_PER_DAY = 1     # 運用シミュレーション：1日に新しく買う最大銘柄数
+
+
+def similar_table(t):
+    """会社員ルールの取引から「似た取引」の成績表を作る。区分＝条件×損切り幅（5段階）×地合い。
+    件数が少ない区分は、条件×損切り幅 → 条件だけ、と粗くした区分の値を使う"""
+    edges = list(t["損切り幅%"].quantile([.2, .4, .6, .8]))
+    t = t.assign(band=t["損切り幅%"].map(lambda v: sum(v > e for e in edges)))
+    table = {}
+    for keys in (["strategy"], ["strategy", "band"], ["strategy", "band", "地合い"]):
+        for key, g in t.groupby(keys):
+            key = key if isinstance(key, tuple) else (key,)
+            if len(g) >= MIN_SIMILAR:
+                table["|".join(map(str, key))] = {"件数": len(g), "勝率": round((g["r"] > 0).mean() * 100, 1),
+                                                  "実効R": round(g["eff"].mean(), 3)}
+    return {"edges": edges, "table": table}
+
+
+def similar_lookup(model, strategy, width, mood):
+    band = sum(width > e for e in model["edges"])
+    for key in (f"{strategy}|{band}|{mood}", f"{strategy}|{band}", strategy):
+        if key in model["table"]:
+            return model["table"][key]
+    return None
+
+
+def portfolio(trades, mood):
+    """前半4年で「似た取引の成績」を作り、後半2年で ①その成績は当たるか ②選び方で運用成績が変わるか を確かめる"""
+    t = pd.DataFrame([x for x in trades if x["rule"] == "寄付" and x["filled"] and affordable(x)])
+    if t.empty:
+        return "", None
+    t["地合い"] = t["date"].map(lambda d: "追い風" if mood.get(d, False) else "向かい風")
+    t["eff"] = t["ret"] * t["buy"] / (t["risk"] + t["buy"] * BUFFER)
+    t["shares"] = [shares(b, b - r) for b, r in zip(t["buy"], t["risk"])]
+    t["yen"] = t["shares"] * t["buy"] * t["ret"]
+    split = t["date"].min() + (t["date"].max() - t["date"].min()) * 4 / 6
+    train, test = t[t["date"] < split], t[t["date"] >= split].copy()
+    model = similar_table(train)
+    hits = [similar_lookup(model, s, w, m) for s, w, m in zip(test["strategy"], test["損切り幅%"], test["地合い"])]
+    test["score"] = [h["実効R"] if h else float("nan") for h in hits]
+    test["pwin"] = [h["勝率"] if h else float("nan") for h in hits]
+    test = test.dropna(subset=["score"])
+    html = (f"<h1>似た取引の成績は当たるか（{split:%Y年%m月}以降の取引で確認）</h1>"
+            f"<p>{split:%Y年%m月}より前の取引だけで「条件×損切り幅×地合い」ごとの勝率と期待値を作り、それ以降の取引に当てはめた。"
+            "予想の高い組ほど実際の成績も高ければ、候補の並べ替えに使える。</p><div class=w><table>"
+            "<tr><th>予想の組</th><th>件数</th><th>予想勝率</th><th>実際の勝率</th><th>予想の期待値</th><th>実際の期待値</th></tr>")
+    for j, (_, g) in enumerate(test.groupby(pd.qcut(test["score"].rank(method="first"), 5, labels=False))):
+        html += (f"<tr><th>{['低い', 'やや低い', '中くらい', 'やや高い', '高い'][j]}</th><td>{len(g)}</td>"
+                 f"<td>{g['pwin'].mean():.1f}%</td><td>{(g['r'] > 0).mean() * 100:.1f}%</td>"
+                 f"<td>{g['score'].mean() * LOSS_LIMIT:+.0f}円</td><td>{g['eff'].mean() * LOSS_LIMIT:+.0f}円</td></tr>")
+    html += "</table></div><p>期待値は損失上限2,000円・余裕幅込みの株数で1回あたり平均何円残るか。</p>"
+    days = sorted(test["date"].unique())
+    by_day = {d: g for d, g in test.groupby("date")}
+    html += (f"<h1>運用シミュレーション（資金{CAPITAL // 10000}万円・同時{MAX_POS}銘柄まで・1日{NEW_PER_DAY}銘柄まで、{split:%Y年%m月}以降）</h1>"
+             "<p>毎日の候補から選び方を変えて買い続けた場合の比較。ランダムは20回の平均。</p><div class=w><table>"
+             "<tr><th>選び方</th><th>取引数</th><th>勝率</th><th>合計損益</th><th>1回平均</th><th>最大の落ち込み</th></tr>")
+    methods = [("リスクリワード順（今のサイト）", lambda g, rnd: g.sort_values("rr", ascending=False)),
+               ("似た取引の期待値順", lambda g, rnd: g.sort_values("score", ascending=False)),
+               ("ランダム", lambda g, rnd: g.sample(frac=1, random_state=rnd))]
+    for name, order in methods:
+        res = []
+        for rnd in range(20 if name == "ランダム" else 1):
+            held, done = [], []
+            for d in days:
+                held = [h for h in held if h["exit_date"] > d]
+                if d not in by_day:
+                    continue
+                new = 0
+                for _, c in order(by_day[d], rnd).iterrows():
+                    if len(held) >= MAX_POS or new >= NEW_PER_DAY:
+                        break
+                    cost = c["shares"] * c["buy"]
+                    if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > CAPITAL:
+                        continue
+                    held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost})
+                    done.append((c["exit_date"], c["yen"]))
+                    new += 1
+            pnl = pd.Series([y for _, y in sorted(done)])
+            curve = pnl.cumsum()
+            res.append((len(pnl), (pnl > 0).mean() * 100, pnl.sum(), pnl.mean(), (curve.cummax().clip(lower=0) - curve).max()))
+        n, w, tot, avg, dd = [sum(x[k] for x in res) / len(res) for k in range(5)]
+        html += (f"<tr><th>{name}</th><td>{n:.0f}</td><td>{w:.1f}%</td><td>{tot:+,.0f}円</td>"
+                 f"<td>{avg:+,.0f}円</td><td>-{dd:,.0f}円</td></tr>")
+    html += "</table></div><p>最大の落ち込みは、損益の合計が一番高かった時点からどれだけ減ったか（実現損益ベース）。</p>"
+    return html, similar_table(t)
+
+
 def build(rows, n, extra=""):
     head = "<th>件数</th><th>勝率</th><th>期待値R</th><th>実効R</th><th>平均損益</th><th>平均日数</th><th>損切り</th><th>利確</th><th>期限切れ</th><th>最悪R</th><th>1.5R超</th><th>2R超</th><th>損切り超過95%</th>"
     body = ""
@@ -233,11 +324,14 @@ def main():
                       if (d["Close"] * d["Volume"]).iloc[-250:].mean() >= MIN_TURNOVER}.items())[:SAMPLE])
     print(f"検証対象 {len(data)} 銘柄")
     mood = mood_series().to_dict()
-    jobs = [(d, len(d) - YEARS * 245) for d in data.values()]
+    jobs = [(d, len(d) - YEARS * 245, t.replace(".T", "")) for t, d in data.items()]
     with Pool() as p:
         trades = [x for ts in p.map(run_stock, jobs) for x in ts]
     rows = summarize(trades, mood)
-    build(rows, len(data), bigloss(trades, mood))
+    sim_html, model = portfolio(trades, mood)
+    build(rows, len(data), sim_html + bigloss(trades, mood))
+    if model:
+        (OUT / "similar.json").write_text(json.dumps(model, ensure_ascii=False), encoding="utf-8")
     for r in rows:
         print(r["条件"], r["全体"], r["買える"]["全体"])
 
