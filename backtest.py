@@ -15,7 +15,7 @@ import yfinance as yf
 from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TURNOVER, STRATEGIES, day_range, fetch, load_universe, shares, similar_lookup
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
-YEARS = 6           # 検証期間
+YEARS = 10          # 検証期間（検証用：10年）
 MAX_HOLD = 30       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
