@@ -240,31 +240,44 @@ def portfolio(trades, mood):
     methods = [("リスクリワード順（今のサイト）", lambda g, rnd: g.sort_values("rr", ascending=False)),
                ("似た取引の期待値順", lambda g, rnd: g.sort_values("score", ascending=False)),
                ("ランダム", lambda g, rnd: g.sample(frac=1, random_state=rnd))]
-    for name, order in methods:
-        res = []
-        for rnd in range(20 if name == "ランダム" else 1):
-            held, done = [], []
-            for d in days:
-                held = [h for h in held if h["exit_date"] > d]
-                if d not in by_day:
+    def run(order, rnd, max_pos):
+        held, done = [], []
+        for d in days:
+            held = [h for h in held if h["exit_date"] > d]
+            if d not in by_day:
+                continue
+            new = 0
+            for _, c in order(by_day[d], rnd).iterrows():
+                if len(held) >= max_pos or new >= NEW_PER_DAY:
+                    break
+                cost = c["shares"] * c["buy"]
+                if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > CAPITAL:
                     continue
-                new = 0
-                for _, c in order(by_day[d], rnd).iterrows():
-                    if len(held) >= MAX_POS or new >= NEW_PER_DAY:
-                        break
-                    cost = c["shares"] * c["buy"]
-                    if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > CAPITAL:
-                        continue
-                    held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost})
-                    done.append((c["exit_date"], c["yen"]))
-                    new += 1
-            pnl = pd.Series([y for _, y in sorted(done)])
-            curve = pnl.cumsum()
-            res.append((len(pnl), (pnl > 0).mean() * 100, pnl.sum(), pnl.mean(), (curve.cummax().clip(lower=0) - curve).max()))
-        n, w, tot, avg, dd = [sum(x[k] for x in res) / len(res) for k in range(5)]
+                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost})
+                done.append((c["exit_date"], c["yen"]))
+                new += 1
+        pnl = pd.Series([y for _, y in sorted(done)])
+        curve = pnl.cumsum()
+        return (len(pnl), (pnl > 0).mean() * 100, pnl.sum(), pnl.mean(), (curve.cummax().clip(lower=0) - curve).max())
+
+    def average(name, order, max_pos):
+        res = [run(order, rnd, max_pos) for rnd in range(20 if name == "ランダム" else 1)]
+        return [sum(x[k] for x in res) / len(res) for k in range(5)]
+
+    for name, order in methods:
+        n, w, tot, avg, dd = average(name, order, MAX_POS)
         html += (f"<tr><th>{name}</th><td>{n:.0f}</td><td>{w:.1f}%</td><td>{tot:+,.0f}円</td>"
                  f"<td>{avg:+,.0f}円</td><td>-{dd:,.0f}円</td></tr>")
     html += "</table></div><p>最大の落ち込みは、損益の合計が一番高かった時点からどれだけ減ったか（実現損益ベース）。</p>"
+    html += ("<h1>同時に持つ銘柄数の比較（1日1銘柄まで、同じ後半期間）</h1>"
+             "<p>同時保有の上限だけ変えて、選び方ごとの成績を比べた。</p><div class=w><table>"
+             "<tr><th>選び方</th><th>同時上限</th><th>取引数</th><th>勝率</th><th>合計損益</th><th>1回平均</th><th>最大の落ち込み</th></tr>")
+    for name, order in methods:
+        for max_pos in (1, 2, 3, 5, 8):
+            n, w, tot, avg, dd = average(name, order, max_pos)
+            html += (f"<tr><th>{name}</th><td>{max_pos}銘柄</td><td>{n:.0f}</td><td>{w:.1f}%</td>"
+                     f"<td>{tot:+,.0f}円</td><td>{avg:+,.0f}円</td><td>-{dd:,.0f}円</td></tr>")
+    html += "</table></div>"
     return html, similar_table(t)
 
 
