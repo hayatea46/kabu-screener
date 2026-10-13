@@ -240,9 +240,11 @@ def portfolio(trades, mood):
     methods = [("リスクリワード順（今のサイト）", lambda g, rnd: g.sort_values("rr", ascending=False)),
                ("似た取引の期待値順", lambda g, rnd: g.sort_values("score", ascending=False)),
                ("ランダム", lambda g, rnd: g.sample(frac=1, random_state=rnd))]
-    def run(order, rnd, max_pos, thr=None):
-        held, done = [], []
+    def run(order, rnd, max_pos, thr=None, compound=False):
+        held, done, equity = [], [], CAPITAL
         for d in days:
+            for h in [h for h in held if h["exit_date"] <= d]:
+                equity += h["yen"]   # 決済済みの損益を資金に足す（複利のときだけ株数に効く）
             held = [h for h in held if h["exit_date"] > d]
             if d not in by_day:
                 continue
@@ -252,19 +254,20 @@ def portfolio(trades, mood):
                     break
                 if thr is not None and len(held) >= 2 and not c["pwin"] > thr:
                     continue   # 基本2銘柄。3銘柄目以降は似た取引の勝率がしきい値超えの銘柄だけ
-                cost = c["shares"] * c["buy"]
-                if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > CAPITAL:
+                f = equity / CAPITAL if compound else 1.0   # 複利：資金に比例して株数（損失上限も）を増減
+                cost = c["shares"] * c["buy"] * f
+                if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > equity:
                     continue
-                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost})
-                done.append((c["exit_date"], c["yen"]))
+                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": c["yen"] * f})
+                done.append((c["exit_date"], c["yen"] * f))
                 new += 1
         pnl = pd.Series([y for _, y in sorted(done)])
-        curve = pnl.cumsum()
-        return (len(pnl), (pnl > 0).mean() * 100, pnl.sum(), pnl.mean(), (curve.cummax().clip(lower=0) - curve).max())
+        curve = CAPITAL + pnl.cumsum()
+        return (len(pnl), (pnl > 0).mean() * 100, pnl.sum(), pnl.mean(), (curve.cummax().clip(lower=CAPITAL) - curve).max(), curve.iloc[-1])
 
-    def average(name, order, max_pos, thr=None):
-        res = [run(order, rnd, max_pos, thr) for rnd in range(20 if name == "ランダム" else 1)]
-        return [sum(x[k] for x in res) / len(res) for k in range(5)]
+    def average(name, order, max_pos, thr=None, compound=False, full=False):
+        res = [run(order, rnd, max_pos, thr, compound) for rnd in range(20 if name == "ランダム" else 1)]
+        return [sum(x[k] for x in res) / len(res) for k in range(6 if full else 5)]
 
     for name, order in methods:
         n, w, tot, avg, dd = average(name, order, MAX_POS)
@@ -288,6 +291,17 @@ def portfolio(trades, mood):
             n, w, tot, avg, dd = average(name, order, max_pos, thr)
             html += (f"<tr><th>{name}</th><td>{label}</td><td>{n:.0f}</td><td>{w:.1f}%</td>"
                      f"<td>{tot:+,.0f}円</td><td>{avg:+,.0f}円</td><td>-{dd:,.0f}円</td></tr>")
+    html += "</table></div>"
+    yrs = max((days[-1] - days[0]).days / 365.25, 0.1)
+    html += (f"<h1>複利の場合（{split:%Y年%m月}以降、約{yrs:.1f}年、元手{CAPITAL // 10000}万円）</h1>"
+             "<p>決済のたびに資金が増減し、次の買いの株数（損失上限は資金の2%）も資金に比例して変える。1株未満の端数は無視。税金・手数料は引いていない。</p><div class=w><table>"
+             "<tr><th>選び方</th><th>ルール</th><th>取引数</th><th>最終資金</th><th>増減率</th><th>年率</th><th>最大の落ち込み</th></tr>")
+    for name, order in methods:
+        for label, max_pos, thr in (("2銘柄まで", 2, None), ("3銘柄まで", 3, None), ("2銘柄＋勝率60%超で3銘柄目", 3, 60)):
+            for comp in (False, True):
+                n, w, tot, avg, dd, fin = average(name, order, max_pos, thr, comp, True)
+                html += (f"<tr><th>{name}</th><td>{label}（{'複利' if comp else '単利'}）</td><td>{n:.0f}</td><td>{fin:,.0f}円</td>"
+                         f"<td>{(fin / CAPITAL - 1) * 100:+.0f}%</td><td>{((max(fin, 1) / CAPITAL) ** (1 / yrs) - 1) * 100:+.1f}%</td><td>-{dd:,.0f}円</td></tr>")
     html += "</table></div>"
     return html, similar_table(t)
 
