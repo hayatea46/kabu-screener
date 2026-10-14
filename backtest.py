@@ -15,14 +15,16 @@ import yfinance as yf
 from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TURNOVER, STRATEGIES, day_range, fetch, load_universe, shares, similar_lookup
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
-YEARS = 10          # 検証期間（検証用：10年）
+YEARS = 30          # 検証期間（検証用：30年）
 MAX_HOLD = 30       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
 
 
 def mood_series():
-    t = yf.download("1306.T", period=f"{YEARS + 2}y", progress=False, auto_adjust=True)["Close"].squeeze().dropna()
+    sym = "1306.T" if YEARS <= 20 else "^N225"   # 1306は2001年上場。長期検証は日経平均で判定
+    t = yf.download(sym, period=f"{YEARS + 2}y", progress=False, auto_adjust=True)["Close"].squeeze().dropna()
+    t.index = t.index.tz_localize(None) if t.index.tz is not None else t.index
     return t > t.rolling(25).mean()
 
 
@@ -207,6 +209,62 @@ def similar_table(t):
     return {"edges": edges, "table": table}
 
 
+def walkforward(t):
+    """毎年「その年より前の取引だけ」で成績表を作り、その年を2銘柄まで・1日1銘柄で運用する（全期間が未来を見ない検証）"""
+    years = sorted(t["date"].dt.year.unique())
+    html = ("<h1>毎年ローリング検証（前年までの取引で成績表を作り、翌年を運用）</h1>"
+            "<p>2銘柄まで・1日1銘柄まで。最初の3年は成績表づくりに使うため運用しない。複利は決済のたびに株数を資金に比例させる。税金・手数料なし。</p><div class=w><table>"
+            "<tr><th>年</th><th>取引数</th><th>期待値順 単利</th><th>期待値順 複利の資金</th><th>ランダム 単利</th><th>RR順 単利</th></tr>")
+    eq = {"期待値順": CAPITAL, "ランダム": CAPITAL}
+    tot = {"期待値順": 0, "ランダム": 0, "RR順": 0}
+    low = {"期待値順": CAPITAL, "ランダム": CAPITAL}
+    curve = {"期待値順": [], "ランダム": []}
+    def sim(test, order, compound, equity, rnd=0):
+        held, pnl = [], 0.0
+        for d in sorted(test["date"].unique()):
+            for h in [h for h in held if h["exit_date"] <= d]:
+                equity += h["yen"]
+                pnl += h["yen"]
+            held = [h for h in held if h["exit_date"] > d]
+            new = 0
+            for _, c in order(test[test["date"] == d], rnd).iterrows():
+                if len(held) >= 2 or new >= NEW_PER_DAY:
+                    break
+                f = equity / CAPITAL if compound else 1.0
+                cost = c["shares"] * c["buy"] * f
+                if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > equity:
+                    continue
+                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": c["yen"] * f})
+                new += 1
+        for h in held:
+            equity += h["yen"]
+            pnl += h["yen"]
+        return pnl, equity
+    for y in years[3:]:
+        train, test = t[t["date"].dt.year < y], t[t["date"].dt.year == y].copy()
+        model = similar_table(train)
+        hits = [similar_lookup(model, s_, w, m) for s_, w, m in zip(test["strategy"], test["損切り幅%"], test["地合い"])]
+        test["score"] = [h["実効R"] if h else float("nan") for h in hits]
+        test = test.dropna(subset=["score"])
+        if test.empty:
+            continue
+        p_ev, _ = sim(test, lambda g, r: g.sort_values("score", ascending=False), False, CAPITAL)
+        _, eq["期待値順"] = sim(test, lambda g, r: g.sort_values("score", ascending=False), True, eq["期待値順"])
+        rs = [sim(test, lambda g, r: g.sample(frac=1, random_state=r), False, CAPITAL, r)[0] for r in range(10)]
+        p_rd = sum(rs) / len(rs)
+        p_rr, _ = sim(test, lambda g, r: g.sort_values("rr", ascending=False), False, CAPITAL)
+        tot["期待値順"] += p_ev
+        tot["ランダム"] += p_rd
+        tot["RR順"] += p_rr
+        html += (f"<tr><th>{y}</th><td>{len(test)}</td><td>{p_ev:+,.0f}円</td><td>{eq['期待値順']:,.0f}円</td>"
+                 f"<td>{p_rd:+,.0f}円</td><td>{p_rr:+,.0f}円</td></tr>")
+    n = max(len(years) - 3, 1)
+    html += (f"<tr><th>合計（{n}年）</th><td></td><td>{tot['期待値順']:+,.0f}円</td><td>{eq['期待値順']:,.0f}円"
+             f"（{(eq['期待値順'] / CAPITAL - 1) * 100:+.0f}%）</td><td>{tot['ランダム']:+,.0f}円</td><td>{tot['RR順']:+,.0f}円</td></tr>")
+    html += "</table></div><p>複利の年率は {:+.1f}% （期待値順）。</p>".format(((max(eq['期待値順'], 1) / CAPITAL) ** (1 / n) - 1) * 100)
+    return html
+
+
 def portfolio(trades, mood):
     """前半4年で「似た取引の成績」を作り、後半2年で ①その成績は当たるか ②選び方で運用成績が変わるか を確かめる"""
     t = pd.DataFrame([x for x in trades if x["rule"] == "寄付" and x["filled"] and affordable(x)])
@@ -303,6 +361,7 @@ def portfolio(trades, mood):
                 html += (f"<tr><th>{name}</th><td>{label}（{'複利' if comp else '単利'}）</td><td>{n:.0f}</td><td>{fin:,.0f}円</td>"
                          f"<td>{(fin / CAPITAL - 1) * 100:+.0f}%</td><td>{((max(fin, 1) / CAPITAL) ** (1 / yrs) - 1) * 100:+.1f}%</td><td>-{dd:,.0f}円</td></tr>")
     html += "</table></div>"
+    html += walkforward(t)
     return html, similar_table(t)
 
 
