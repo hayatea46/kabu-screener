@@ -240,11 +240,11 @@ def active(edge):
             if label not in edge or edge[label]["ref"] or edge[label]["r"] >= MIN_EDGE]
 
 
-def shares(entry, stop, lot=LOT):
+def shares(entry, stop, lot=LOT, capital=None, loss_limit=None):
     """買える株数。損切り幅＋余裕（株価×BUFFER）での損失が LOSS_LIMIT 以内、買い代金が CAPITAL 以内になる最大株数（lot 単位で切り捨て）。0なら買えない"""
     if entry - stop <= 0 or entry <= 0:
         return 0
-    n = min(LOSS_LIMIT // (entry - stop + entry * BUFFER), CAPITAL // entry)
+    n = min((loss_limit or LOSS_LIMIT) // (entry - stop + entry * BUFFER), (capital or CAPITAL) // entry)
     return int(n // lot * lot)
 
 
