@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+from patterns import NEW_CHECKS, NEW_LABELS
 from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TURNOVER, STRATEGIES, day_range, fetch, load_universe, shares, similar_lookup
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
@@ -19,6 +20,7 @@ YEARS = 30          # 検証期間（検証用：30年）
 MAX_HOLD = 30       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
+ALL_CHECKS = {**CHECKS, **NEW_CHECKS}   # 本番の6条件＋検証専用の追加パターン＋ランダム買い基準
 
 
 def mood_series():
@@ -84,12 +86,12 @@ def features(win, s):
 def run_stock(args):
     d, start, code = args
     trades = []
-    busy = {(k, rule): -1 for k in CHECKS for rule in ("指値", "寄付")}
+    busy = {(k, rule): -1 for k in ALL_CHECKS for rule in ("指値", "寄付")}
     for i in range(max(start, WINDOW), len(d) - 1):
         win = d.iloc[i - WINDOW + 1:i + 1]
         if (win["Close"] * win["Volume"]).iloc[-20:].mean() < MIN_TURNOVER or day_range(win) > MAX_RANGE:
             continue
-        for k, f in CHECKS.items():
+        for k, f in ALL_CHECKS.items():
             if i <= busy[k, "指値"] and i <= busy[k, "寄付"]:
                 continue
             try:
@@ -105,6 +107,8 @@ def run_stock(args):
                 if res is None:
                     continue
                 res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"], rr=s["rr"], code=code, **features(win, s))
+                if i + 20 < len(d):   # 型の比較用：翌朝寄付から20営業日後の終値までの騰落
+                    res["fwd20"] = d["Close"].iloc[i + 20] / d["Open"].iloc[i + 1] - 1
                 if res["filled"]:
                     res.update(buy_date=d.index[i + 1], exit_date=d.index[res["exit"]])
                 trades.append(res)
@@ -332,6 +336,28 @@ def unit_compare(t):
             + rows + "</table></div>")
 
 
+def pattern_compare(trades):
+    """型の比較：ランダム買い（基準）と並べる。20日後の騰落は、同じ月のランダム買いの平均を引いた「超過」で見る（相場全体の上げ下げを除くため）"""
+    t = pd.DataFrame([x for x in trades if x["rule"] == "寄付" and x["filled"]])
+    t["month"] = t["date"].dt.to_period("M")
+    base = t[t["strategy"] == "random_buy"].groupby("month")["fwd20"].mean()
+    t["excess"] = t["fwd20"] - t["month"].map(base)
+    labels = {**{k: v[0] for k, v in STRATEGIES.items()}, **NEW_LABELS}
+    html = ("<h1>型の比較（ランダム買いを基準に）</h1>"
+            "<p>寄付成行ルール・損切りの余裕幅なし。超過＝シグナル翌朝から20営業日後の騰落率から、同じ月のランダム買いの平均を引いた値。"
+            "t値は2以上なら偶然では出にくい目安（同じ日の取引は似た動きをするため、実際はこれより甘い）。</p><div class=w><table>"
+            "<tr><th>型</th><th>件数</th><th>勝率</th><th>期待値R</th><th>20日後の騰落</th><th>超過</th><th>超過のt値</th></tr>")
+    for k in list(labels):
+        g = t[t["strategy"] == k]
+        if g.empty:
+            continue
+        e = g["excess"].dropna()
+        tv = e.mean() / (e.std() / len(e) ** 0.5) if len(e) > 2 and e.std() > 0 else float("nan")
+        html += (f"<tr><th>{labels[k]}</th><td>{len(g)}</td><td>{(g['r'] > 0).mean() * 100:.1f}%</td><td>{g['r'].mean():+.2f}</td>"
+                 f"<td>{g['fwd20'].mean() * 100:+.2f}%</td><td>{e.mean() * 100:+.2f}%</td><td>{tv:+.1f}</td></tr>")
+    return html + "</table></div>"
+
+
 def portfolio(trades, mood):
     """前半4年で「似た取引の成績」を作り、後半2年で ①その成績は当たるか ②選び方で運用成績が変わるか を確かめる"""
     t = pd.DataFrame([x for x in trades if x["rule"] == "寄付" and x["filled"] and affordable(x)])
@@ -483,9 +509,10 @@ def main():
     jobs = [(d, len(d) - YEARS * 245, t.replace(".T", "")) for t, d in data.items()]
     with Pool() as p:
         trades = [x for ts in p.map(run_stock, jobs) for x in ts]
-    rows = summarize(trades, mood)
-    sim_html, model = portfolio(trades, mood)
-    build(rows, len(data), sim_html + bigloss(trades, mood))
+    base_trades = [x for x in trades if x["strategy"] in CHECKS]   # 本番の6条件だけ（追加パターンはサイトの成績表に混ぜない）
+    rows = summarize(base_trades, mood)
+    sim_html, model = portfolio(base_trades, mood)
+    build(rows, len(data), pattern_compare(trades) + sim_html + bigloss(base_trades, mood))
     if model:
         (OUT / "similar.json").write_text(json.dumps(model, ensure_ascii=False), encoding="utf-8")
     for r in rows:
