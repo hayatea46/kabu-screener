@@ -20,7 +20,8 @@ YEARS = 30          # 検証期間（検証用：30年）
 MAX_HOLD = 30       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
-ALL_CHECKS = {**CHECKS, **NEW_CHECKS}   # 本番の6条件＋検証専用の追加パターン＋ランダム買い基準
+RUN_NEW = ("hammer", "engulfing", "random_buy")   # 追加パターンのうち今回回すもの（他は2026-10-14の全14行検証で負け・検証不能と分かったので外す。全部回すと約3時間）
+ALL_CHECKS = {**CHECKS, **{k: v for k, v in NEW_CHECKS.items() if k in RUN_NEW}}   # 本番の6条件＋検証専用の追加パターン＋ランダム買い基準
 
 
 def mood_series():
@@ -355,7 +356,37 @@ def pattern_compare(trades):
         tv = e.mean() / (e.std() / len(e) ** 0.5) if len(e) > 2 and e.std() > 0 else float("nan")
         html += (f"<tr><th>{labels[k]}</th><td>{len(g)}</td><td>{(g['r'] > 0).mean() * 100:.1f}%</td><td>{g['r'].mean():+.2f}</td>"
                  f"<td>{g['fwd20'].mean() * 100:+.2f}%</td><td>{e.mean() * 100:+.2f}%</td><td>{tv:+.1f}</td></tr>")
-    return html + "</table></div>"
+    return html + "</table></div>" + robustness(t, labels)
+
+
+def robustness(t, labels):
+    """勝った型が安定しているか：年別・前半後半・月単位のt値・暴落月を除いた超過"""
+    keys = ["oversold", "hammer", "engulfing", "box_bottom", "pullback"]
+    crash = set(t[t["strategy"] == "random_buy"].groupby("month")["fwd20"].mean().loc[lambda s: s < -0.05].index)
+    t = t.assign(year=t["date"].dt.year)
+    years = sorted(t["year"].unique())
+    half = years[len(years) // 2]
+    html = ("<h1>勝った型は安定しているか</h1><p>超過（同じ月のランダム買い比）を、年別・前半後半・月ごとに集計し直した値で見る。"
+            "月単位のt値は、同じ月の取引を1つにまとめるので、時期の集中の影響が小さい。"
+            "暴落月は、その月のランダム買いの20日後平均が-5%以下の月。</p><div class=w><table><tr><th>型</th><th>全期間</th>"
+            f"<th>{years[0]}〜{half - 1}年</th><th>{half}〜{years[-1]}年</th><th>プラスの年</th><th>月単位のt値</th><th>暴落月を除く</th><th>暴落月だけ</th></tr>")
+    for k in keys:
+        g = t[(t["strategy"] == k)].dropna(subset=["excess"])
+        if g.empty:
+            continue
+        yr = g.groupby("year")["excess"].mean()
+        mo = g.groupby("month")["excess"].mean()
+        tv = mo.mean() / (mo.std() / len(mo) ** 0.5) if len(mo) > 2 else float("nan")
+        nc, cr = g[~g["month"].isin(crash)], g[g["month"].isin(crash)]
+        f = lambda s: f"{s['excess'].mean() * 100:+.2f}%" if len(s) else "-"
+        html += (f"<tr><th>{labels[k]}</th><td>{f(g)}</td><td>{f(g[g['year'] < half])}</td><td>{f(g[g['year'] >= half])}</td>"
+                 f"<td>{(yr > 0).sum()}/{len(yr)}年</td><td>{tv:+.1f}</td><td>{f(nc)}</td><td>{f(cr)}</td></tr>")
+    html += "</table></div><h2>売られすぎ反発の年別の超過</h2><div class=w><table><tr>"
+    g = t[t["strategy"] == "oversold"].dropna(subset=["excess"])
+    yr = g.groupby("year")["excess"].agg(["mean", "size"])
+    html += "".join(f"<th>{y}</th>" for y in yr.index) + "</tr><tr>"
+    html += "".join(f"<td>{r['mean'] * 100:+.1f}%<br>({int(r['size'])}件)</td>" for _, r in yr.iterrows()) + "</tr></table></div>"
+    return html
 
 
 def portfolio(trades, mood):
