@@ -409,6 +409,47 @@ def exit_compare(trades):
     return html + "</table></div>"
 
 
+def _prep(trades, exit_name, sp):
+    """売られすぎ反発の取引を、指定した出口の結果で並べ直す。余裕幅（損切りの滑りの95%点）も返す"""
+    tr = []
+    for x in trades:
+        if x["rule"] == "寄付" and x["filled"] and x["strategy"] == "oversold" and x.get("exits"):
+            e = x["exits"].get(exit_name)
+            if e:
+                tr.append({"date": x["date"], "exit_date": e["exit_date"], "code": x["code"], "buy": x["buy"], "ret": e["ret"], "stopped": e["stopped"]})
+    slip = pd.Series([max(0.0, -e["ret"] - sp) for e in tr if e["stopped"]])
+    by_day = {}
+    for e in tr:
+        by_day.setdefault(e["date"], []).append(e)
+    return by_day, sorted(by_day), (float(slip.quantile(.95)) if len(slip) else 0.0)
+
+
+def _run_port(by_day, days, cap0, lot, sp, buf, lim, maxpos, seed):
+    """運用シミュレーション：1日1銘柄まで、同時に maxpos 銘柄まで、候補はランダム、複利。(取引数, 最終資金, 最大の落ち込み, 最悪の1回, 上限超え率, 平均同時保有)"""
+    rnd = random.Random(seed)
+    cap, held, curve, worst, over, n, occ = cap0, [], [cap0], 0.0, 0, 0, 0
+    for d in days:
+        for h in sorted([h for h in held if h["exit_date"] <= d], key=lambda h: h["exit_date"]):
+            cap += h["yen"]
+            curve.append(cap)
+            worst = min(worst, h["yen"] / h["cap"])
+            over += h["yen"] < -h["cap"] * lim
+            n += 1
+        held = [h for h in held if h["exit_date"] > d]
+        c = rnd.choice(by_day[d])
+        if len(held) < maxpos and not any(h["code"] == c["code"] for h in held):
+            k = shares(c["buy"], c["buy"] * (1 - sp), lot, cap, cap * lim, buf)
+            cost = k * c["buy"]
+            if k > 0 and cost + sum(h["cost"] for h in held) <= cap:
+                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": cost * c["ret"], "cap": cap})
+        occ += len(held)
+    for h in held:
+        cap += h["yen"]
+        curve.append(cap)
+    s = pd.Series(curve)
+    return n, cap, ((s.cummax() - s) / s.cummax()).max(), -worst, over / max(n, 1), occ / max(len(days), 1)
+
+
 def risk_sweep(trades):
     """損失上限×余裕幅×注文方法の比較：売られすぎ反発だけを、同時2銘柄・1日1銘柄・複利で運用した場合（候補はランダムに選ぶ。10回平均）。
     余裕幅は、その出口で損切りが名目より何%余計に滑ったかの95%点をデータから求めて使う"""
@@ -423,46 +464,30 @@ def risk_sweep(trades):
             "損失上限超え＝1回の損失が上限（資金の何%）を超えた割合。税金・手数料なし。候補はランダムに選び、10回の平均。</p><div class=w><table>"
             "<tr><th>設定</th><th>余裕幅</th><th>損失上限</th><th>取引数/年</th><th>年率</th><th>最大の落ち込み</th><th>最悪の1回</th><th>上限超え</th></tr>")
     for label, cap0, lot, exit_name, sp in scen:
-        tr = []
-        for x in base:
-            e = x["exits"].get(exit_name)
-            if e:
-                tr.append({"date": x["date"], "exit_date": e["exit_date"], "code": x["code"], "buy": x["buy"], "ret": e["ret"], "stopped": e["stopped"]})
-        slip = pd.Series([max(0.0, -e["ret"] - sp) for e in tr if e["stopped"]])
-        buf = float(slip.quantile(.95)) if len(slip) else 0.0
-        by_day = {}
-        for e in tr:
-            by_day.setdefault(e["date"], []).append(e)
-        days = sorted(by_day)
+        by_day, days, buf = _prep(base, exit_name, sp)
         for lim in (0.01, 0.02, 0.03, 0.05):
-            res = []
-            for seed in range(10):
-                rnd = random.Random(seed)
-                cap, held, curve, worst, over, n = cap0, [], [cap0], 0.0, 0, 0
-                for d in days:
-                    for h in sorted([h for h in held if h["exit_date"] <= d], key=lambda h: h["exit_date"]):
-                        cap += h["yen"]
-                        curve.append(cap)
-                        worst = min(worst, h["yen"] / h["cap"])
-                        over += h["yen"] < -h["cap"] * lim
-                        n += 1
-                    held = [h for h in held if h["exit_date"] > d]
-                    c = rnd.choice(by_day[d])
-                    if len(held) >= 2 or any(h["code"] == c["code"] for h in held):
-                        continue
-                    k = shares(c["buy"], c["buy"] * (1 - sp), lot, cap, cap * lim, buf)
-                    cost = k * c["buy"]
-                    if k <= 0 or cost + sum(h["cost"] for h in held) > cap:
-                        continue
-                    held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": cost * c["ret"], "cap": cap})
-                for h in held:
-                    cap += h["yen"]
-                    curve.append(cap)
-                s = pd.Series(curve)
-                res.append((n / years, (max(cap, 1) / cap0) ** (1 / years) - 1, ((s.cummax() - s) / s.cummax()).max(), -worst, over / max(n, 1)))
-            m = [sum(r[i] for r in res) / len(res) for i in range(5)]
-            html += (f"<tr><th>{label}</th><td>{buf * 100:.1f}%</td><td>{lim * 100:.0f}%</td><td>{m[0]:.0f}</td><td>{m[1] * 100:+.1f}%</td>"
-                     f"<td>-{m[2] * 100:.0f}%</td><td>-{m[3] * 100:.1f}%</td><td>{m[4] * 100:.1f}%</td></tr>")
+            res = [_run_port(by_day, days, cap0, lot, sp, buf, lim, 2, seed) for seed in range(10)]
+            m = [sum(r[i] for r in res) / len(res) for i in range(6)]
+            html += (f"<tr><th>{label}</th><td>{buf * 100:.1f}%</td><td>{lim * 100:.0f}%</td><td>{m[0] / years:.0f}</td>"
+                     f"<td>{((max(m[1], 1) / cap0) ** (1 / years) - 1) * 100:+.1f}%</td><td>-{m[2] * 100:.0f}%</td><td>-{m[3] * 100:.1f}%</td><td>{m[4] * 100:.1f}%</td></tr>")
+    return html + "</table></div>" + diversify_sweep(base, years)
+
+
+def diversify_sweep(base, years):
+    """分散の比較：同時保有数を増やし、1銘柄あたりの損失上限を下げると、年率÷落ち込みは上がるか"""
+    html = ("<h1>分散の比較（売られすぎ反発・複利・1日1銘柄まで）</h1>"
+            "<p>同時保有数を増やし、1銘柄あたりの損失上限を下げた場合。出口は20日保有＋損切り-8%（100万円・100株は逆指値）。"
+            "年率÷落ち込みが大きいほど効率が良い（前回の2銘柄では約0.1）。資金不足で買えない分は見送り。10回平均。</p><div class=w><table>"
+            "<tr><th>設定</th><th>同時保有</th><th>1銘柄の損失上限</th><th>平均の保有数</th><th>取引数/年</th><th>年率</th><th>最大の落ち込み</th><th>年率÷落ち込み</th></tr>")
+    for label, cap0, lot, exit_name in (("10万円・1株・成行", 100000, 1, "20日保有＋損切り-8%"), ("100万円・100株・逆指値", 1000000, 100, "20日保有＋逆指値-8%")):
+        by_day, days, buf = _prep(base, exit_name, 0.08)
+        for maxpos in (2, 5, 10, 20):
+            for lim in (0.0025, 0.005, 0.01, 0.02):
+                res = [_run_port(by_day, days, cap0, lot, 0.08, buf, lim, maxpos, seed) for seed in range(6)]
+                m = [sum(r[i] for r in res) / len(res) for i in range(6)]
+                ann = (max(m[1], 1) / cap0) ** (1 / years) - 1
+                html += (f"<tr><th>{label}</th><td>{maxpos}</td><td>{lim * 100:.2f}%</td><td>{m[5]:.1f}</td><td>{m[0] / years:.0f}</td>"
+                         f"<td>{ann * 100:+.1f}%</td><td>-{m[2] * 100:.0f}%</td><td>{ann / max(m[2], 1e-9):.2f}</td></tr>")
     return html + "</table></div>"
 
 
