@@ -378,7 +378,7 @@ def pattern_compare(trades):
         tv = e.mean() / (e.std() / len(e) ** 0.5) if len(e) > 2 and e.std() > 0 else float("nan")
         html += (f"<tr><th>{labels[k]}</th><td>{len(g)}</td><td>{(g['r'] > 0).mean() * 100:.1f}%</td><td>{g['r'].mean():+.2f}</td>"
                  f"<td>{g['fwd20'].mean() * 100:+.2f}%</td><td>{e.mean() * 100:+.2f}%</td><td>{tv:+.1f}</td></tr>")
-    return html + "</table></div>" + robustness(t, labels)
+    return html + "</table></div>" + robustness(t, labels) + price_band(t)
 
 
 def exit_compare(trades):
@@ -489,6 +489,26 @@ def diversify_sweep(base, years):
                 ann = (max(m[1], 1) / cap0) ** (1 / years) - 1
                 html += (f"<tr><th>{label}</th><td>{maxpos}</td><td>{lim * 100:.2f}%</td><td>{m[5]:.1f}</td><td>{m[0] / years:.0f}</td>"
                          f"<td>{ann * 100:+.1f}%</td><td>-{m[2] * 100:.0f}%</td><td>{ann / max(m[2], 1e-9):.2f}</td></tr>")
+    return html + "</table></div>"
+
+
+def price_band(t):
+    """売られすぎ反発の優位は、株価の低い銘柄だけのものか。超過は「同じ株価帯・同じ月」のランダム買いとの差"""
+    bands = [(0, 500, "〜500円"), (500, 1000, "500〜1000円"), (1000, 3000, "1000〜3000円"), (3000, 1e9, "3000円〜")]
+    t = t.assign(band=pd.cut(t["buy"], [b[0] for b in bands] + [1e9], right=False, labels=[b[2] for b in bands]))
+    html = ("<h1>株価帯別の超過（売られすぎ反発）</h1><p>超過＝20日後の騰落率から、同じ株価帯・同じ月のランダム買いの平均を引いた値。"
+            "全体で勝っているなら入口の優位は本物、低位株だけなら生存者バイアスの疑いが濃い。</p><div class=w><table>"
+            "<tr><th>株価帯</th><th>件数</th><th>勝率</th><th>20日後の騰落</th><th>超過</th><th>月単位のt値</th></tr>")
+    for _, _, name in bands:
+        r = t[(t["band"] == name) & (t["strategy"] == "random_buy")].groupby("month")["fwd20"].mean()
+        g = t[(t["band"] == name) & (t["strategy"] == "oversold")].copy()
+        if g.empty:
+            continue
+        g["ex"] = g["fwd20"] - g["month"].map(r)
+        mo = g.dropna(subset=["ex"]).groupby("month")["ex"].mean()
+        tv = mo.mean() / (mo.std() / len(mo) ** 0.5) if len(mo) > 2 and mo.std() > 0 else float("nan")
+        html += (f"<tr><th>{name}</th><td>{len(g)}</td><td>{(g['r'] > 0).mean() * 100:.1f}%</td><td>{g['fwd20'].mean() * 100:+.2f}%</td>"
+                 f"<td>{g['ex'].mean() * 100:+.2f}%</td><td>{tv:+.1f}</td></tr>")
     return html + "</table></div>"
 
 
