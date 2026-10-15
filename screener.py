@@ -376,11 +376,34 @@ def build_site(results, mood, council, keys, edge):
     (OUT / "council_input.json").write_text(json.dumps(council, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
 
+HOLDINGS = {"6849": ("日本光電工業", 1527, 1828), "8081": ("カナデン", 2576, 3190)}   # 紙上トレードの保有銘柄 コード: (名前, 損切り値, 目標値)
+
+
+def write_holdings(data):
+    """保有銘柄の直近の始値・高値・安値・終値と、終値での損切り／利確の判定を docs/holdings.json に書く（失敗しても毎日の実行は止めない）"""
+    try:
+        out = {}
+        for code, (name, stop, target) in HOLDINGS.items():
+            d = data.get(code + ".T")
+            if d is None or d.empty:
+                out[code] = {"銘柄名": name, "判定": "株価を取得できず"}
+                continue
+            last = float(d["Close"].iloc[-1])
+            out[code] = {"銘柄名": name, "損切り値": stop, "目標値": target, "最新終値": round(last, 1),
+                         "判定": "損切り（翌朝の寄付で売る）" if last <= stop else "利確（翌朝の寄付で売る）" if last >= target else "継続",
+                         "直近": [[str(i.date()), round(float(r["Open"]), 1), round(float(r["High"]), 1), round(float(r["Low"]), 1), round(float(r["Close"]), 1)]
+                                for i, r in d.tail(6).iterrows()]}
+        (OUT / "holdings.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:
+        print("保有銘柄の出力エラー:", e)
+
+
 def main():
     names = load_universe()
     print(f"対象 {len(names)} 銘柄")
     data = fetch(list(names))
     print(f"取得 {len(data)} 銘柄")
+    write_holdings(data)
     mood = market_mood()
     results = screen(data, names, mood, load_similar())
     edge = load_edge(mood)
