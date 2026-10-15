@@ -12,17 +12,22 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+from patterns import NEW_CHECKS, NEW_LABELS
 from screener import BUFFER, CAPITAL, CHECKS, LOSS_LIMIT, LOT, MAX_RANGE, MIN_TURNOVER, STRATEGIES, day_range, fetch, load_universe, shares, similar_lookup
 
 SAMPLE = 600        # 検証する銘柄数（売買代金の条件を満たす中からランダム）
-YEARS = 6           # 検証期間
+YEARS = 30          # 検証期間（検証用：30年）
 MAX_HOLD = 30       # 最大保有営業日
 WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
+RUN_NEW = ("random_buy",)   # 追加パターンのうち今回回すもの（他は2026-10-14の全14行検証で負け・検証不能と分かったので外す。全部回すと約3時間）
+ALL_CHECKS = {**CHECKS, **{k: v for k, v in NEW_CHECKS.items() if k in RUN_NEW}}   # 本番の6条件＋検証専用の追加パターン＋ランダム買い基準
 
 
 def mood_series():
-    t = yf.download("1306.T", period=f"{YEARS + 2}y", progress=False, auto_adjust=True)["Close"].squeeze().dropna()
+    sym = "1306.T" if YEARS <= 20 else "^N225"   # 1306は2001年上場。長期検証は日経平均で判定
+    t = yf.download(sym, period=f"{YEARS + 2}y", progress=False, auto_adjust=True)["Close"].squeeze().dropna()
+    t.index = t.index.tz_localize(None) if t.index.tz is not None else t.index
     return t > t.rolling(25).mean()
 
 
@@ -68,6 +73,26 @@ def simulate_open(d, i, s):
                 "why": why or "期限切れ", "buy": buy, "risk": risk, "rule": "寄付"}
 
 
+EXIT_TEST = ("oversold", "random_buy")   # 出口ルールを比べる型（売られすぎ反発とランダム買い基準）
+EXITS = {"20日保有のみ": (20, None, False), "20日保有＋損切り-8%": (20, 0.08, False), "20日保有＋損切り-5%": (20, 0.05, False),
+         "10日保有＋損切り-5%": (10, 0.05, False), "20日保有＋逆指値-8%": (20, 0.08, True), "20日保有＋逆指値-5%": (20, 0.05, True)}
+
+
+def simulate_exit(d, i, hold, stop_pct, intraday=False):
+    """翌朝寄付に成行で買う。損切りは2通り：引けが買値の-stop_pct以下なら翌朝寄付に成行（intraday=False）、
+    前夜に逆指値を入れておき日中に届いたらその場で売る（intraday=True。窓開けなら始値）。保有日数の満了は翌朝寄付に成行"""
+    buy = d["Open"].iloc[i + 1]
+    stop = buy * (1 - stop_pct) if stop_pct is not None else None
+    for k in range(i + 1, i + 1 + hold):
+        if k + 1 >= len(d):
+            return None
+        if intraday and d["Low"].iloc[k] <= stop:
+            return {"ret": min(stop, d["Open"].iloc[k]) / buy - 1, "days": k - i, "stopped": True, "exit_date": d.index[k]}
+        stopped = stop is not None and not intraday and d["Close"].iloc[k] <= stop
+        if stopped or k == i + hold:
+            return {"ret": d["Open"].iloc[k + 1] / buy - 1, "days": k + 1 - i, "stopped": stopped, "exit_date": d.index[k + 1]}
+
+
 def features(win, s):
     """シグナル時点で分かる特徴（大負けの傾向分析用）"""
     c, v = win["Close"], win["Volume"]
@@ -82,12 +107,12 @@ def features(win, s):
 def run_stock(args):
     d, start, code = args
     trades = []
-    busy = {(k, rule): -1 for k in CHECKS for rule in ("指値", "寄付")}
+    busy = {(k, rule): -1 for k in ALL_CHECKS for rule in ("指値", "寄付")}
     for i in range(max(start, WINDOW), len(d) - 1):
         win = d.iloc[i - WINDOW + 1:i + 1]
         if (win["Close"] * win["Volume"]).iloc[-20:].mean() < MIN_TURNOVER or day_range(win) > MAX_RANGE:
             continue
-        for k, f in CHECKS.items():
+        for k, f in ALL_CHECKS.items():
             if i <= busy[k, "指値"] and i <= busy[k, "寄付"]:
                 continue
             try:
@@ -103,6 +128,10 @@ def run_stock(args):
                 if res is None:
                     continue
                 res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"], rr=s["rr"], code=code, **features(win, s))
+                if rule == "寄付" and k in EXIT_TEST and res["filled"]:
+                    res["exits"] = {n: simulate_exit(d, i, h, sp, iday) for n, (h, sp, iday) in EXITS.items()}
+                if i + 20 < len(d):   # 型の比較用：翌朝寄付から20営業日後の終値までの騰落
+                    res["fwd20"] = d["Close"].iloc[i + 20] / d["Open"].iloc[i + 1] - 1
                 if res["filled"]:
                     res.update(buy_date=d.index[i + 1], exit_date=d.index[res["exit"]])
                 trades.append(res)
@@ -207,6 +236,291 @@ def similar_table(t):
     return {"edges": edges, "table": table}
 
 
+def walkforward(t):
+    """毎年「その年より前の取引だけ」で成績表を作り、その年を2銘柄まで・1日1銘柄で運用する（全期間が未来を見ない検証）"""
+    years = sorted(t["date"].dt.year.unique())
+    html = ("<h1>毎年ローリング検証（前年までの取引で成績表を作り、翌年を運用）</h1>"
+            "<p>2銘柄まで・1日1銘柄まで。最初の3年は成績表づくりに使うため運用しない。複利は決済のたびに株数を資金に比例させる。税金・手数料なし。</p><div class=w><table>"
+            "<tr><th>年</th><th>取引数</th><th>期待値順 単利</th><th>期待値順 複利の資金</th><th>ランダム 単利</th><th>RR順 単利</th></tr>")
+    eq = {"期待値順": CAPITAL, "ランダム": CAPITAL}
+    tot = {"期待値順": 0, "ランダム": 0, "RR順": 0}
+    low = {"期待値順": CAPITAL, "ランダム": CAPITAL}
+    curve = {"期待値順": [], "ランダム": []}
+    def sim(test, order, compound, equity, rnd=0):
+        held, pnl = [], 0.0
+        for d in sorted(test["date"].unique()):
+            for h in [h for h in held if h["exit_date"] <= d]:
+                equity += h["yen"]
+                pnl += h["yen"]
+            held = [h for h in held if h["exit_date"] > d]
+            new = 0
+            for _, c in order(test[test["date"] == d], rnd).iterrows():
+                if len(held) >= 2 or new >= NEW_PER_DAY:
+                    break
+                f = equity / CAPITAL if compound else 1.0
+                cost = c["shares"] * c["buy"] * f
+                if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > equity:
+                    continue
+                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": c["yen"] * f})
+                new += 1
+        for h in held:
+            equity += h["yen"]
+            pnl += h["yen"]
+        return pnl, equity
+    for y in years[3:]:
+        train, test = t[t["date"].dt.year < y], t[t["date"].dt.year == y].copy()
+        model = similar_table(train)
+        hits = [similar_lookup(model, s_, w, m) for s_, w, m in zip(test["strategy"], test["損切り幅%"], test["地合い"])]
+        test["score"] = [h["実効R"] if h else float("nan") for h in hits]
+        test = test.dropna(subset=["score"])
+        if test.empty:
+            continue
+        p_ev, _ = sim(test, lambda g, r: g.sort_values("score", ascending=False), False, CAPITAL)
+        _, eq["期待値順"] = sim(test, lambda g, r: g.sort_values("score", ascending=False), True, eq["期待値順"])
+        rs = [sim(test, lambda g, r: g.sample(frac=1, random_state=r), False, CAPITAL, r)[0] for r in range(10)]
+        p_rd = sum(rs) / len(rs)
+        p_rr, _ = sim(test, lambda g, r: g.sort_values("rr", ascending=False), False, CAPITAL)
+        tot["期待値順"] += p_ev
+        tot["ランダム"] += p_rd
+        tot["RR順"] += p_rr
+        html += (f"<tr><th>{y}</th><td>{len(test)}</td><td>{p_ev:+,.0f}円</td><td>{eq['期待値順']:,.0f}円</td>"
+                 f"<td>{p_rd:+,.0f}円</td><td>{p_rr:+,.0f}円</td></tr>")
+    n = max(len(years) - 3, 1)
+    html += (f"<tr><th>合計（{n}年）</th><td></td><td>{tot['期待値順']:+,.0f}円</td><td>{eq['期待値順']:,.0f}円"
+             f"（{(eq['期待値順'] / CAPITAL - 1) * 100:+.0f}%）</td><td>{tot['ランダム']:+,.0f}円</td><td>{tot['RR順']:+,.0f}円</td></tr>")
+    html += "</table></div><p>複利の年率は {:+.1f}% （期待値順）。</p>".format(((max(eq['期待値順'], 1) / CAPITAL) ** (1 / n) - 1) * 100)
+    return html
+
+
+def unit_compare(t):
+    """売買単位の比較：毎年ローリング（前年までの取引で成績表→翌年を運用、2銘柄まで・1日1銘柄・期待値順）で、
+    10万円・1株単位 と 100万円・100株単位 を並べる。株数は決済のたびに「そのときの資金」で計算し直す（複利）。単利は元手固定"""
+    years = sorted(t["date"].dt.year.unique())
+    scen = [("10万円・1株単位", 100000, 1), ("100万円・1株単位", 1000000, 1), ("100万円・100株単位", 1000000, 100)]
+    rows = ""
+    def sim(test, cap0, lot, compound, st):
+        held = []
+        eq = st["eq"]
+        for d in sorted(test["date"].unique()):
+            for h in sorted([h for h in held if h["exit_date"] <= d], key=lambda h: h["exit_date"]):
+                eq += h["yen"]
+                st["curve"].append(eq)
+            held = [h for h in held if h["exit_date"] > d]
+            new = 0
+            for _, c in test[test["date"] == d].sort_values("score", ascending=False).iterrows():
+                if len(held) >= 2 or new >= NEW_PER_DAY:
+                    break
+                cap = eq if compound else cap0
+                n = shares(c["buy"], c["buy"] - c["risk"], lot, cap, cap * 0.02)
+                if n <= 0 or any(h["code"] == c["code"] for h in held):
+                    continue
+                cost = n * c["buy"]
+                if cost + sum(h["cost"] for h in held) > cap:
+                    continue
+                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": n * c["buy"] * c["ret"]})
+                st["n"] += 1
+                st["cost"].append(cost)
+                new += 1
+        for h in sorted(held, key=lambda h: h["exit_date"]):
+            eq += h["yen"]
+            st["curve"].append(eq)
+        st["eq"] = eq
+    for compound in (True, False):
+        state = {n: {"eq": c, "curve": [c], "n": 0, "cand": 0, "ok": 0, "cost": []} for n, c, _ in scen}
+        for y in years[3:]:
+            train, test = t[t["date"].dt.year < y], t[t["date"].dt.year == y].copy()
+            model = similar_table(train)
+            hits = [similar_lookup(model, s_, w, m) for s_, w, m in zip(test["strategy"], test["損切り幅%"], test["地合い"])]
+            test["score"] = [h["実効R"] if h else float("nan") for h in hits]
+            test = test.dropna(subset=["score"])
+            if test.empty:
+                continue
+            for name, cap0, lot in scen:
+                st = state[name]
+                st["cand"] += len(test)
+                st["ok"] += sum(shares(b, b - r, lot, cap0, cap0 * 0.02) > 0 for b, r in zip(test["buy"], test["risk"]))
+                sim(test, cap0, lot, compound, st)
+        n_years = max(len(years) - 3, 1)
+        label = "複利" if compound else "単利（元手固定）"
+        rows += f"<tr><th colspan=8>{label}</th></tr>"
+        for name, cap0, lot in scen:
+            st = state[name]
+            c = pd.Series(st["curve"])
+            dd = ((c.cummax() - c) / c.cummax()).max() * 100
+            fin = st["eq"]
+            ann = ((max(fin, 1) / cap0) ** (1 / n_years) - 1) * 100
+            avgc = sum(st["cost"]) / max(len(st["cost"]), 1)
+            rows += (f"<tr><th>{name}</th><td>{st['ok'] / max(st['cand'], 1) * 100:.0f}%</td><td>{st['n']}</td><td>{avgc:,.0f}円</td>"
+                    f"<td>{fin:,.0f}円</td><td>{ann:+.1f}%</td><td>-{dd:.1f}%</td><td>{(fin - cap0) / cap0 * 100:+.0f}%</td></tr>")
+    return ("<h1>売買単位の比較（毎年ローリング・2銘柄まで・期待値順）</h1>"
+            "<p>損失上限は常に資金の2%（余裕幅7%込み）。100株単位は、損切り幅＋株価7%の100株分が上限に収まる銘柄しか買えない。"
+            "買える候補の割合は、その年の候補のうち1株でも（100株単位なら100株）買える割合。税金・手数料なし。</p><div class=w><table>"
+            "<tr><th>設定</th><th>買える候補</th><th>取引数</th><th>1回の投入額</th><th>最終資金</th><th>年率</th><th>最大の落ち込み</th><th>増減率</th></tr>"
+            + rows + "</table></div>")
+
+
+def pattern_compare(trades):
+    """型の比較：ランダム買い（基準）と並べる。20日後の騰落は、同じ月のランダム買いの平均を引いた「超過」で見る（相場全体の上げ下げを除くため）"""
+    t = pd.DataFrame([x for x in trades if x["rule"] == "寄付" and x["filled"]])
+    t["month"] = t["date"].dt.to_period("M")
+    base = t[t["strategy"] == "random_buy"].groupby("month")["fwd20"].mean()
+    t["excess"] = t["fwd20"] - t["month"].map(base)
+    labels = {**{k: v[0] for k, v in STRATEGIES.items()}, **NEW_LABELS}
+    html = ("<h1>型の比較（ランダム買いを基準に）</h1>"
+            "<p>寄付成行ルール・損切りの余裕幅なし。超過＝シグナル翌朝から20営業日後の騰落率から、同じ月のランダム買いの平均を引いた値。"
+            "t値は2以上なら偶然では出にくい目安（同じ日の取引は似た動きをするため、実際はこれより甘い）。</p><div class=w><table>"
+            "<tr><th>型</th><th>件数</th><th>勝率</th><th>期待値R</th><th>20日後の騰落</th><th>超過</th><th>超過のt値</th></tr>")
+    for k in list(labels):
+        g = t[t["strategy"] == k]
+        if g.empty:
+            continue
+        e = g["excess"].dropna()
+        tv = e.mean() / (e.std() / len(e) ** 0.5) if len(e) > 2 and e.std() > 0 else float("nan")
+        html += (f"<tr><th>{labels[k]}</th><td>{len(g)}</td><td>{(g['r'] > 0).mean() * 100:.1f}%</td><td>{g['r'].mean():+.2f}</td>"
+                 f"<td>{g['fwd20'].mean() * 100:+.2f}%</td><td>{e.mean() * 100:+.2f}%</td><td>{tv:+.1f}</td></tr>")
+    return html + "</table></div>" + robustness(t, labels)
+
+
+def exit_compare(trades):
+    """出口ルールの比較：売られすぎ反発とランダム買いに同じ出口を当て、同じ月のランダム買いとの差（超過）で見る"""
+    rows = []
+    for x in trades:
+        if x["rule"] == "寄付" and x["filled"] and x["strategy"] in EXIT_TEST and x.get("exits"):
+            base = {"現行の損切り・利確（30日まで）": {"ret": x["ret"], "days": x["days"], "stopped": x["why"] == "損切り"}}
+            for n, e in {**base, **x["exits"]}.items():
+                if e:
+                    rows.append({"strategy": x["strategy"], "exit": n, "month": x["date"].to_period("M"), **e})
+    t = pd.DataFrame(rows)
+    html = ("<h1>出口ルールの比較（売られすぎ反発）</h1>"
+            "<p>同じシグナルに、出口だけ変えて当てた。翌朝寄付に成行で買い、毎日の引けで判断して翌朝寄付に成行で売る。"
+            "超過＝売られすぎ反発の1回の損益率から、同じ出口・同じ月のランダム買いの平均を引いた値。"
+            "月単位のt値は同じ月の取引を1つにまとめた値。株数の違いは調整していない。</p><div class=w><table>"
+            "<tr><th>出口</th><th>件数</th><th>勝率</th><th>1回平均</th><th>損切り率</th><th>平均日数</th>"
+            "<th>最悪</th><th>ランダム買い1回平均</th><th>超過</th><th>月単位のt値</th></tr>")
+    for n in t["exit"].unique():
+        g, r = t[(t["strategy"] == "oversold") & (t["exit"] == n)], t[(t["strategy"] == "random_buy") & (t["exit"] == n)]
+        base = r.groupby("month")["ret"].mean()
+        ex = (g["ret"] - g["month"].map(base)).dropna()
+        mo = ex.groupby(g.loc[ex.index, "month"]).mean()
+        tv = mo.mean() / (mo.std() / len(mo) ** 0.5) if len(mo) > 2 else float("nan")
+        html += (f"<tr><th>{n}</th><td>{len(g)}</td><td>{(g['ret'] > 0).mean() * 100:.1f}%</td><td>{g['ret'].mean() * 100:+.2f}%</td>"
+                 f"<td>{g['stopped'].mean() * 100:.0f}%</td><td>{g['days'].mean():.1f}</td><td>{g['ret'].min() * 100:.0f}%</td>"
+                 f"<td>{r['ret'].mean() * 100:+.2f}%</td><td>{ex.mean() * 100:+.2f}%</td><td>{tv:+.1f}</td></tr>")
+    return html + "</table></div>"
+
+
+def _prep(trades, exit_name, sp):
+    """売られすぎ反発の取引を、指定した出口の結果で並べ直す。余裕幅（損切りの滑りの95%点）も返す"""
+    tr = []
+    for x in trades:
+        if x["rule"] == "寄付" and x["filled"] and x["strategy"] == "oversold" and x.get("exits"):
+            e = x["exits"].get(exit_name)
+            if e:
+                tr.append({"date": x["date"], "exit_date": e["exit_date"], "code": x["code"], "buy": x["buy"], "ret": e["ret"], "stopped": e["stopped"]})
+    slip = pd.Series([max(0.0, -e["ret"] - sp) for e in tr if e["stopped"]])
+    by_day = {}
+    for e in tr:
+        by_day.setdefault(e["date"], []).append(e)
+    return by_day, sorted(by_day), (float(slip.quantile(.95)) if len(slip) else 0.0)
+
+
+def _run_port(by_day, days, cap0, lot, sp, buf, lim, maxpos, seed):
+    """運用シミュレーション：1日1銘柄まで、同時に maxpos 銘柄まで、候補はランダム、複利。(取引数, 最終資金, 最大の落ち込み, 最悪の1回, 上限超え率, 平均同時保有)"""
+    rnd = random.Random(seed)
+    cap, held, curve, worst, over, n, occ = cap0, [], [cap0], 0.0, 0, 0, 0
+    for d in days:
+        for h in sorted([h for h in held if h["exit_date"] <= d], key=lambda h: h["exit_date"]):
+            cap += h["yen"]
+            curve.append(cap)
+            worst = min(worst, h["yen"] / h["cap"])
+            over += h["yen"] < -h["cap"] * lim
+            n += 1
+        held = [h for h in held if h["exit_date"] > d]
+        c = rnd.choice(by_day[d])
+        if len(held) < maxpos and not any(h["code"] == c["code"] for h in held):
+            k = shares(c["buy"], c["buy"] * (1 - sp), lot, cap, cap * lim, buf)
+            cost = k * c["buy"]
+            if k > 0 and cost + sum(h["cost"] for h in held) <= cap:
+                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": cost * c["ret"], "cap": cap})
+        occ += len(held)
+    for h in held:
+        cap += h["yen"]
+        curve.append(cap)
+    s = pd.Series(curve)
+    return n, cap, ((s.cummax() - s) / s.cummax()).max(), -worst, over / max(n, 1), occ / max(len(days), 1)
+
+
+def risk_sweep(trades):
+    """損失上限×余裕幅×注文方法の比較：売られすぎ反発だけを、同時2銘柄・1日1銘柄・複利で運用した場合（候補はランダムに選ぶ。10回平均）。
+    余裕幅は、その出口で損切りが名目より何%余計に滑ったかの95%点をデータから求めて使う"""
+    scen = [("10万円・1株・成行の損切り", 100000, 1, "20日保有＋損切り-8%", 0.08),
+            ("100万円・100株・成行の損切り", 1000000, 100, "20日保有＋損切り-8%", 0.08),
+            ("100万円・100株・逆指値", 1000000, 100, "20日保有＋逆指値-8%", 0.08)]
+    base = [x for x in trades if x["rule"] == "寄付" and x["filled"] and x["strategy"] == "oversold" and x.get("exits")]
+    days_all = sorted({x["date"] for x in base})
+    years = max((days_all[-1] - days_all[0]).days / 365.25, 0.1)
+    html = ("<h1>損失上限と余裕幅の比較（売られすぎ反発・同時2銘柄・複利）</h1>"
+            "<p>出口は20日保有＋損切り-8%。株数＝損失上限÷（損切り幅8%＋余裕幅）。余裕幅は損切りの滑りの95%点（成行は翌朝寄付での滑り、逆指値は窓開けでの滑り）。"
+            "損失上限超え＝1回の損失が上限（資金の何%）を超えた割合。税金・手数料なし。候補はランダムに選び、10回の平均。</p><div class=w><table>"
+            "<tr><th>設定</th><th>余裕幅</th><th>損失上限</th><th>取引数/年</th><th>年率</th><th>最大の落ち込み</th><th>最悪の1回</th><th>上限超え</th></tr>")
+    for label, cap0, lot, exit_name, sp in scen:
+        by_day, days, buf = _prep(base, exit_name, sp)
+        for lim in (0.01, 0.02, 0.03, 0.05):
+            res = [_run_port(by_day, days, cap0, lot, sp, buf, lim, 2, seed) for seed in range(10)]
+            m = [sum(r[i] for r in res) / len(res) for i in range(6)]
+            html += (f"<tr><th>{label}</th><td>{buf * 100:.1f}%</td><td>{lim * 100:.0f}%</td><td>{m[0] / years:.0f}</td>"
+                     f"<td>{((max(m[1], 1) / cap0) ** (1 / years) - 1) * 100:+.1f}%</td><td>-{m[2] * 100:.0f}%</td><td>-{m[3] * 100:.1f}%</td><td>{m[4] * 100:.1f}%</td></tr>")
+    return html + "</table></div>" + diversify_sweep(base, years)
+
+
+def diversify_sweep(base, years):
+    """分散の比較：同時保有数を増やし、1銘柄あたりの損失上限を下げると、年率÷落ち込みは上がるか"""
+    html = ("<h1>分散の比較（売られすぎ反発・複利・1日1銘柄まで）</h1>"
+            "<p>同時保有数を増やし、1銘柄あたりの損失上限を下げた場合。出口は20日保有＋損切り-8%（100万円・100株は逆指値）。"
+            "年率÷落ち込みが大きいほど効率が良い（前回の2銘柄では約0.1）。資金不足で買えない分は見送り。10回平均。</p><div class=w><table>"
+            "<tr><th>設定</th><th>同時保有</th><th>1銘柄の損失上限</th><th>平均の保有数</th><th>取引数/年</th><th>年率</th><th>最大の落ち込み</th><th>年率÷落ち込み</th></tr>")
+    for label, cap0, lot, exit_name in (("10万円・1株・成行", 100000, 1, "20日保有＋損切り-8%"), ("100万円・100株・逆指値", 1000000, 100, "20日保有＋逆指値-8%")):
+        by_day, days, buf = _prep(base, exit_name, 0.08)
+        for maxpos in (2, 5, 10, 20):
+            for lim in (0.0025, 0.005, 0.01, 0.02):
+                res = [_run_port(by_day, days, cap0, lot, 0.08, buf, lim, maxpos, seed) for seed in range(6)]
+                m = [sum(r[i] for r in res) / len(res) for i in range(6)]
+                ann = (max(m[1], 1) / cap0) ** (1 / years) - 1
+                html += (f"<tr><th>{label}</th><td>{maxpos}</td><td>{lim * 100:.2f}%</td><td>{m[5]:.1f}</td><td>{m[0] / years:.0f}</td>"
+                         f"<td>{ann * 100:+.1f}%</td><td>-{m[2] * 100:.0f}%</td><td>{ann / max(m[2], 1e-9):.2f}</td></tr>")
+    return html + "</table></div>"
+
+
+def robustness(t, labels):
+    """勝った型が安定しているか：年別・前半後半・月単位のt値・暴落月を除いた超過"""
+    keys = ["oversold", "hammer", "engulfing", "box_bottom", "pullback"]
+    crash = set(t[t["strategy"] == "random_buy"].groupby("month")["fwd20"].mean().loc[lambda s: s < -0.05].index)
+    t = t.assign(year=t["date"].dt.year)
+    years = sorted(t["year"].unique())
+    half = years[len(years) // 2]
+    html = ("<h1>勝った型は安定しているか</h1><p>超過（同じ月のランダム買い比）を、年別・前半後半・月ごとに集計し直した値で見る。"
+            "月単位のt値は、同じ月の取引を1つにまとめるので、時期の集中の影響が小さい。"
+            "暴落月は、その月のランダム買いの20日後平均が-5%以下の月。</p><div class=w><table><tr><th>型</th><th>全期間</th>"
+            f"<th>{years[0]}〜{half - 1}年</th><th>{half}〜{years[-1]}年</th><th>プラスの年</th><th>月単位のt値</th><th>暴落月を除く</th><th>暴落月だけ</th></tr>")
+    for k in keys:
+        g = t[(t["strategy"] == k)].dropna(subset=["excess"])
+        if g.empty:
+            continue
+        yr = g.groupby("year")["excess"].mean()
+        mo = g.groupby("month")["excess"].mean()
+        tv = mo.mean() / (mo.std() / len(mo) ** 0.5) if len(mo) > 2 else float("nan")
+        nc, cr = g[~g["month"].isin(crash)], g[g["month"].isin(crash)]
+        f = lambda s: f"{s['excess'].mean() * 100:+.2f}%" if len(s) else "-"
+        html += (f"<tr><th>{labels[k]}</th><td>{f(g)}</td><td>{f(g[g['year'] < half])}</td><td>{f(g[g['year'] >= half])}</td>"
+                 f"<td>{(yr > 0).sum()}/{len(yr)}年</td><td>{tv:+.1f}</td><td>{f(nc)}</td><td>{f(cr)}</td></tr>")
+    html += "</table></div><h2>売られすぎ反発の年別の超過</h2><div class=w><table><tr>"
+    g = t[t["strategy"] == "oversold"].dropna(subset=["excess"])
+    yr = g.groupby("year")["excess"].agg(["mean", "size"])
+    html += "".join(f"<th>{y}</th>" for y in yr.index) + "</tr><tr>"
+    html += "".join(f"<td>{r['mean'] * 100:+.1f}%<br>({int(r['size'])}件)</td>" for _, r in yr.iterrows()) + "</tr></table></div>"
+    return html
+
+
 def portfolio(trades, mood):
     """前半4年で「似た取引の成績」を作り、後半2年で ①その成績は当たるか ②選び方で運用成績が変わるか を確かめる"""
     t = pd.DataFrame([x for x in trades if x["rule"] == "寄付" and x["filled"] and affordable(x)])
@@ -240,9 +554,11 @@ def portfolio(trades, mood):
     methods = [("リスクリワード順（今のサイト）", lambda g, rnd: g.sort_values("rr", ascending=False)),
                ("似た取引の期待値順", lambda g, rnd: g.sort_values("score", ascending=False)),
                ("ランダム", lambda g, rnd: g.sample(frac=1, random_state=rnd))]
-    def run(order, rnd, max_pos, thr=None):
-        held, done = [], []
+    def run(order, rnd, max_pos, thr=None, compound=False):
+        held, done, equity = [], [], CAPITAL
         for d in days:
+            for h in [h for h in held if h["exit_date"] <= d]:
+                equity += h["yen"]   # 決済済みの損益を資金に足す（複利のときだけ株数に効く）
             held = [h for h in held if h["exit_date"] > d]
             if d not in by_day:
                 continue
@@ -252,19 +568,20 @@ def portfolio(trades, mood):
                     break
                 if thr is not None and len(held) >= 2 and not c["pwin"] > thr:
                     continue   # 基本2銘柄。3銘柄目以降は似た取引の勝率がしきい値超えの銘柄だけ
-                cost = c["shares"] * c["buy"]
-                if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > CAPITAL:
+                f = equity / CAPITAL if compound else 1.0   # 複利：資金に比例して株数（損失上限も）を増減
+                cost = c["shares"] * c["buy"] * f
+                if any(h["code"] == c["code"] for h in held) or cost + sum(h["cost"] for h in held) > equity:
                     continue
-                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost})
-                done.append((c["exit_date"], c["yen"]))
+                held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": c["yen"] * f})
+                done.append((c["exit_date"], c["yen"] * f))
                 new += 1
         pnl = pd.Series([y for _, y in sorted(done)])
-        curve = pnl.cumsum()
-        return (len(pnl), (pnl > 0).mean() * 100, pnl.sum(), pnl.mean(), (curve.cummax().clip(lower=0) - curve).max())
+        curve = CAPITAL + pnl.cumsum()
+        return (len(pnl), (pnl > 0).mean() * 100, pnl.sum(), pnl.mean(), (curve.cummax().clip(lower=CAPITAL) - curve).max(), curve.iloc[-1])
 
-    def average(name, order, max_pos, thr=None):
-        res = [run(order, rnd, max_pos, thr) for rnd in range(20 if name == "ランダム" else 1)]
-        return [sum(x[k] for x in res) / len(res) for k in range(5)]
+    def average(name, order, max_pos, thr=None, compound=False, full=False):
+        res = [run(order, rnd, max_pos, thr, compound) for rnd in range(20 if name == "ランダム" else 1)]
+        return [sum(x[k] for x in res) / len(res) for k in range(6 if full else 5)]
 
     for name, order in methods:
         n, w, tot, avg, dd = average(name, order, MAX_POS)
@@ -289,6 +606,18 @@ def portfolio(trades, mood):
             html += (f"<tr><th>{name}</th><td>{label}</td><td>{n:.0f}</td><td>{w:.1f}%</td>"
                      f"<td>{tot:+,.0f}円</td><td>{avg:+,.0f}円</td><td>-{dd:,.0f}円</td></tr>")
     html += "</table></div>"
+    yrs = max((days[-1] - days[0]).days / 365.25, 0.1)
+    html += (f"<h1>複利の場合（{split:%Y年%m月}以降、約{yrs:.1f}年、元手{CAPITAL // 10000}万円）</h1>"
+             "<p>決済のたびに資金が増減し、次の買いの株数（損失上限は資金の2%）も資金に比例して変える。1株未満の端数は無視。税金・手数料は引いていない。</p><div class=w><table>"
+             "<tr><th>選び方</th><th>ルール</th><th>取引数</th><th>最終資金</th><th>増減率</th><th>年率</th><th>最大の落ち込み</th></tr>")
+    for name, order in methods:
+        for label, max_pos, thr in (("2銘柄まで", 2, None), ("3銘柄まで", 3, None), ("2銘柄＋勝率60%超で3銘柄目", 3, 60)):
+            for comp in (False, True):
+                n, w, tot, avg, dd, fin = average(name, order, max_pos, thr, comp, True)
+                html += (f"<tr><th>{name}</th><td>{label}（{'複利' if comp else '単利'}）</td><td>{n:.0f}</td><td>{fin:,.0f}円</td>"
+                         f"<td>{(fin / CAPITAL - 1) * 100:+.0f}%</td><td>{((max(fin, 1) / CAPITAL) ** (1 / yrs) - 1) * 100:+.1f}%</td><td>-{dd:,.0f}円</td></tr>")
+    html += "</table></div>"
+    html += walkforward(t) + unit_compare(t)
     return html, similar_table(t)
 
 
@@ -343,9 +672,10 @@ def main():
     jobs = [(d, len(d) - YEARS * 245, t.replace(".T", "")) for t, d in data.items()]
     with Pool() as p:
         trades = [x for ts in p.map(run_stock, jobs) for x in ts]
-    rows = summarize(trades, mood)
-    sim_html, model = portfolio(trades, mood)
-    build(rows, len(data), sim_html + bigloss(trades, mood))
+    base_trades = [x for x in trades if x["strategy"] in CHECKS]   # 本番の6条件だけ（追加パターンはサイトの成績表に混ぜない）
+    rows = summarize(base_trades, mood)
+    sim_html, model = portfolio(base_trades, mood)
+    build(rows, len(data), risk_sweep(trades) + exit_compare(trades) + pattern_compare(trades) + sim_html + bigloss(base_trades, mood))
     if model:
         (OUT / "similar.json").write_text(json.dumps(model, ensure_ascii=False), encoding="utf-8")
     for r in rows:
