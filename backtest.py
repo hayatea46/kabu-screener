@@ -74,18 +74,23 @@ def simulate_open(d, i, s):
 
 
 EXIT_TEST = ("oversold", "random_buy")   # 出口ルールを比べる型（売られすぎ反発とランダム買い基準）
-EXITS = {"20日保有のみ": (20, None), "20日保有＋損切り-8%": (20, 0.08), "20日保有＋損切り-5%": (20, 0.05), "10日保有＋損切り-5%": (10, 0.05)}
+EXITS = {"20日保有のみ": (20, None, False), "20日保有＋損切り-8%": (20, 0.08, False), "20日保有＋損切り-5%": (20, 0.05, False),
+         "10日保有＋損切り-5%": (10, 0.05, False), "20日保有＋逆指値-8%": (20, 0.08, True), "20日保有＋逆指値-5%": (20, 0.05, True)}
 
 
-def simulate_exit(d, i, hold, stop_pct):
-    """翌朝寄付に成行で買い、毎日の引けを見て、損切り（買値の-stop_pct以下）か保有日数の満了なら翌朝寄付に成行で売る"""
+def simulate_exit(d, i, hold, stop_pct, intraday=False):
+    """翌朝寄付に成行で買う。損切りは2通り：引けが買値の-stop_pct以下なら翌朝寄付に成行（intraday=False）、
+    前夜に逆指値を入れておき日中に届いたらその場で売る（intraday=True。窓開けなら始値）。保有日数の満了は翌朝寄付に成行"""
     buy = d["Open"].iloc[i + 1]
+    stop = buy * (1 - stop_pct) if stop_pct is not None else None
     for k in range(i + 1, i + 1 + hold):
         if k + 1 >= len(d):
             return None
-        stopped = stop_pct is not None and d["Close"].iloc[k] <= buy * (1 - stop_pct)
+        if intraday and d["Low"].iloc[k] <= stop:
+            return {"ret": min(stop, d["Open"].iloc[k]) / buy - 1, "days": k - i, "stopped": True, "exit_date": d.index[k]}
+        stopped = stop is not None and not intraday and d["Close"].iloc[k] <= stop
         if stopped or k == i + hold:
-            return {"ret": d["Open"].iloc[k + 1] / buy - 1, "days": k + 1 - i, "stopped": stopped}
+            return {"ret": d["Open"].iloc[k + 1] / buy - 1, "days": k + 1 - i, "stopped": stopped, "exit_date": d.index[k + 1]}
 
 
 def features(win, s):
@@ -124,7 +129,7 @@ def run_stock(args):
                     continue
                 res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"], rr=s["rr"], code=code, **features(win, s))
                 if rule == "寄付" and k in EXIT_TEST and res["filled"]:
-                    res["exits"] = {n: simulate_exit(d, i, h, sp) for n, (h, sp) in EXITS.items()}
+                    res["exits"] = {n: simulate_exit(d, i, h, sp, iday) for n, (h, sp, iday) in EXITS.items()}
                 if i + 20 < len(d):   # 型の比較用：翌朝寄付から20営業日後の終値までの騰落
                     res["fwd20"] = d["Close"].iloc[i + 20] / d["Open"].iloc[i + 1] - 1
                 if res["filled"]:
@@ -404,6 +409,63 @@ def exit_compare(trades):
     return html + "</table></div>"
 
 
+def risk_sweep(trades):
+    """損失上限×余裕幅×注文方法の比較：売られすぎ反発だけを、同時2銘柄・1日1銘柄・複利で運用した場合（候補はランダムに選ぶ。10回平均）。
+    余裕幅は、その出口で損切りが名目より何%余計に滑ったかの95%点をデータから求めて使う"""
+    scen = [("10万円・1株・成行の損切り", 100000, 1, "20日保有＋損切り-8%", 0.08),
+            ("100万円・100株・成行の損切り", 1000000, 100, "20日保有＋損切り-8%", 0.08),
+            ("100万円・100株・逆指値", 1000000, 100, "20日保有＋逆指値-8%", 0.08)]
+    base = [x for x in trades if x["rule"] == "寄付" and x["filled"] and x["strategy"] == "oversold" and x.get("exits")]
+    days_all = sorted({x["date"] for x in base})
+    years = max((days_all[-1] - days_all[0]).days / 365.25, 0.1)
+    html = ("<h1>損失上限と余裕幅の比較（売られすぎ反発・同時2銘柄・複利）</h1>"
+            "<p>出口は20日保有＋損切り-8%。株数＝損失上限÷（損切り幅8%＋余裕幅）。余裕幅は損切りの滑りの95%点（成行は翌朝寄付での滑り、逆指値は窓開けでの滑り）。"
+            "損失上限超え＝1回の損失が上限（資金の何%）を超えた割合。税金・手数料なし。候補はランダムに選び、10回の平均。</p><div class=w><table>"
+            "<tr><th>設定</th><th>余裕幅</th><th>損失上限</th><th>取引数/年</th><th>年率</th><th>最大の落ち込み</th><th>最悪の1回</th><th>上限超え</th></tr>")
+    for label, cap0, lot, exit_name, sp in scen:
+        tr = []
+        for x in base:
+            e = x["exits"].get(exit_name)
+            if e:
+                tr.append({"date": x["date"], "exit_date": e["exit_date"], "code": x["code"], "buy": x["buy"], "ret": e["ret"], "stopped": e["stopped"]})
+        slip = pd.Series([max(0.0, -e["ret"] - sp) for e in tr if e["stopped"]])
+        buf = float(slip.quantile(.95)) if len(slip) else 0.0
+        by_day = {}
+        for e in tr:
+            by_day.setdefault(e["date"], []).append(e)
+        days = sorted(by_day)
+        for lim in (0.01, 0.02, 0.03, 0.05):
+            res = []
+            for seed in range(10):
+                rnd = random.Random(seed)
+                cap, held, curve, worst, over, n = cap0, [], [cap0], 0.0, 0, 0
+                for d in days:
+                    for h in sorted([h for h in held if h["exit_date"] <= d], key=lambda h: h["exit_date"]):
+                        cap += h["yen"]
+                        curve.append(cap)
+                        worst = min(worst, h["yen"] / h["cap"])
+                        over += h["yen"] < -h["cap"] * lim
+                        n += 1
+                    held = [h for h in held if h["exit_date"] > d]
+                    c = rnd.choice(by_day[d])
+                    if len(held) >= 2 or any(h["code"] == c["code"] for h in held):
+                        continue
+                    k = shares(c["buy"], c["buy"] * (1 - sp), lot, cap, cap * lim, buf)
+                    cost = k * c["buy"]
+                    if k <= 0 or cost + sum(h["cost"] for h in held) > cap:
+                        continue
+                    held.append({"code": c["code"], "exit_date": c["exit_date"], "cost": cost, "yen": cost * c["ret"], "cap": cap})
+                for h in held:
+                    cap += h["yen"]
+                    curve.append(cap)
+                s = pd.Series(curve)
+                res.append((n / years, (max(cap, 1) / cap0) ** (1 / years) - 1, ((s.cummax() - s) / s.cummax()).max(), -worst, over / max(n, 1)))
+            m = [sum(r[i] for r in res) / len(res) for i in range(5)]
+            html += (f"<tr><th>{label}</th><td>{buf * 100:.1f}%</td><td>{lim * 100:.0f}%</td><td>{m[0]:.0f}</td><td>{m[1] * 100:+.1f}%</td>"
+                     f"<td>-{m[2] * 100:.0f}%</td><td>-{m[3] * 100:.1f}%</td><td>{m[4] * 100:.1f}%</td></tr>")
+    return html + "</table></div>"
+
+
 def robustness(t, labels):
     """勝った型が安定しているか：年別・前半後半・月単位のt値・暴落月を除いた超過"""
     keys = ["oversold", "hammer", "engulfing", "box_bottom", "pullback"]
@@ -588,7 +650,7 @@ def main():
     base_trades = [x for x in trades if x["strategy"] in CHECKS]   # 本番の6条件だけ（追加パターンはサイトの成績表に混ぜない）
     rows = summarize(base_trades, mood)
     sim_html, model = portfolio(base_trades, mood)
-    build(rows, len(data), exit_compare(trades) + pattern_compare(trades) + sim_html + bigloss(base_trades, mood))
+    build(rows, len(data), risk_sweep(trades) + exit_compare(trades) + pattern_compare(trades) + sim_html + bigloss(base_trades, mood))
     if model:
         (OUT / "similar.json").write_text(json.dumps(model, ensure_ascii=False), encoding="utf-8")
     for r in rows:
