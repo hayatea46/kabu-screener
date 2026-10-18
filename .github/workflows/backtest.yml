@@ -1,6 +1,10 @@
 name: backtest
 on:
   workflow_dispatch:
+    inputs:
+      hold_test:
+        description: "1なら保有日数の比較だけ回す"
+        default: ""
   push:
     branches: [main]
     paths: [backtest.py, screener.py]
@@ -18,6 +22,8 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: python backtest.py
+        env:
+          HOLD_TEST: ${{ inputs.hold_test }}
       - run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"

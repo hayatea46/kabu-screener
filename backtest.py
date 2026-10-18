@@ -5,6 +5,7 @@
 シグナル翌朝に買い、引けで損切り価格以下・利確価格以上なら翌朝寄付で売る。株数は前夜に買値予定と損切り価格から決める。
 """
 import json
+import os
 import random
 from multiprocessing import Pool
 from pathlib import Path
@@ -22,6 +23,11 @@ WINDOW = 300        # 判定に使う過去日数
 OUT = Path("docs")
 RUN_NEW = ("random_buy",)   # 追加パターンのうち今回回すもの（他は2026-10-14の全14行検証で負け・検証不能と分かったので外す。全部回すと約3時間）
 ALL_CHECKS = {**CHECKS, **{k: v for k, v in NEW_CHECKS.items() if k in RUN_NEW}}   # 本番の6条件＋検証専用の追加パターン＋ランダム買い基準
+HOLD_TEST = os.environ.get("HOLD_TEST") == "1"   # 短期保有の比較だけを回す（docs/hold_compare.html のみ出力）
+HOLDS = (1, 3, 5, 10, 20)   # 保有営業日：翌朝寄付で買い、N日後の翌朝寄付に成行で売る
+COST = 0.003                # 往復コスト（手数料・スプレッド・ズレ）
+if HOLD_TEST:
+    ALL_CHECKS = {k: v for k, v in {**CHECKS, **NEW_CHECKS}.items() if k in ("oversold", "hammer", "engulfing", "random_buy")}
 
 
 def mood_series():
@@ -73,7 +79,7 @@ def simulate_open(d, i, s):
                 "why": why or "期限切れ", "buy": buy, "risk": risk, "rule": "寄付"}
 
 
-EXIT_TEST = ("oversold", "random_buy")   # 出口ルールを比べる型（売られすぎ反発とランダム買い基準）
+EXIT_TEST = () if HOLD_TEST else ("oversold", "random_buy")   # 出口ルールを比べる型（売られすぎ反発とランダム買い基準）
 EXITS = {"20日保有のみ": (20, None, False), "20日保有＋損切り-8%": (20, 0.08, False), "20日保有＋損切り-5%": (20, 0.05, False),
          "10日保有＋損切り-5%": (10, 0.05, False), "20日保有＋逆指値-8%": (20, 0.08, True), "20日保有＋逆指値-5%": (20, 0.05, True)}
 
@@ -130,6 +136,7 @@ def run_stock(args):
                 res.update(strategy=k, date=d.index[i], rule=rule, stop=s["stop"], rr=s["rr"], code=code, **features(win, s))
                 if rule == "寄付" and k in EXIT_TEST and res["filled"]:
                     res["exits"] = {n: simulate_exit(d, i, h, sp, iday) for n, (h, sp, iday) in EXITS.items()}
+                res["fh"] = {h: d["Open"].iloc[i + 1 + h] / d["Open"].iloc[i + 1] - 1 for h in HOLDS if i + 1 + h < len(d)}
                 if i + 20 < len(d):   # 型の比較用：翌朝寄付から20営業日後の終値までの騰落
                     res["fwd20"] = d["Close"].iloc[i + 20] / d["Open"].iloc[i + 1] - 1
                 if res["filled"]:
@@ -379,6 +386,38 @@ def pattern_compare(trades):
         html += (f"<tr><th>{labels[k]}</th><td>{len(g)}</td><td>{(g['r'] > 0).mean() * 100:.1f}%</td><td>{g['r'].mean():+.2f}</td>"
                  f"<td>{g['fwd20'].mean() * 100:+.2f}%</td><td>{e.mean() * 100:+.2f}%</td><td>{tv:+.1f}</td></tr>")
     return html + "</table></div>" + robustness(t, labels) + price_band(t)
+
+
+def hold_compare(trades):
+    """保有日数の比較：翌朝寄付で買い、N営業日後の翌朝寄付に成行で売る。超過＝同じ保有日数・同じ月のランダム買いとの差。
+    コスト控除後＝超過から往復コスト(COST)を引いた値（ランダム買いもコストを払うので、超過そのものはコストの影響を受けない点に注意）"""
+    t = pd.DataFrame([x for x in trades if x["rule"] == "寄付" and x["filled"]])
+    t["month"] = t["date"].dt.to_period("M")
+    t["year"] = t["date"].dt.year
+    labels = {"oversold": "売られすぎ反発", "hammer": "ハンマー", "engulfing": "陽線包み足"}
+    half = sorted(t["year"].unique())[len(t["year"].unique()) // 2]
+    html = ("<h1>保有日数の比較</h1><p>翌朝寄付で買い、N営業日後の翌朝寄付に成行で売る。超過＝同じ保有日数・同じ月のランダム買いとの差。"
+            f"コスト控除後の1回平均＝1回平均－往復{COST * 100:.1f}%、超過－コスト＝超過から往復{COST * 100:.1f}%を引いた値。月単位t値は同じ月の取引を1つにまとめたもの。</p><div class=w><table>"
+            f"<tr><th>型</th><th>保有</th><th>件数</th><th>1回平均</th><th>コスト控除後</th><th>超過</th><th>超過－コスト</th><th>月単位t値</th>"
+            f"<th>前半(〜{half - 1})</th><th>後半({half}〜)</th><th>超過がプラスの年</th><th>超過－コストがプラスの年</th></tr>")
+    for h in HOLDS:
+        t["ret_h"] = t["fh"].map(lambda f: f.get(h))
+        base = t[t["strategy"] == "random_buy"].dropna(subset=["ret_h"]).groupby("month")["ret_h"].mean()
+        t["ex_h"] = t["ret_h"] - t["month"].map(base)
+        for k, lab in labels.items():
+            g = t[t["strategy"] == k].dropna(subset=["ex_h"])
+            if g.empty:
+                continue
+            mo, yr = g.groupby("month")["ex_h"].mean(), g.groupby("year")["ex_h"].mean()
+            tv = mo.mean() / (mo.std() / len(mo) ** 0.5) if len(mo) > 2 else float("nan")
+            m = g["ex_h"].mean()
+            html += (f"<tr><th>{lab}</th><td>{h}日</td><td>{len(g)}</td><td>{g['ret_h'].mean() * 100:+.2f}%</td>"
+                     f"<td>{(g['ret_h'].mean() - COST) * 100:+.2f}%</td><td>{m * 100:+.2f}%</td><td>{(m - COST) * 100:+.2f}%</td><td>{tv:+.1f}</td>"
+                     f"<td>{g[g['year'] < half]['ex_h'].mean() * 100:+.2f}%</td><td>{g[g['year'] >= half]['ex_h'].mean() * 100:+.2f}%</td>"
+                     f"<td>{(yr > 0).sum()}/{len(yr)}年</td><td>{(yr > COST).sum()}/{len(yr)}年</td></tr>")
+        r = t[t["strategy"] == "random_buy"].dropna(subset=["ret_h"])
+        html += f"<tr><th>ランダム買い</th><td>{h}日</td><td>{len(r)}</td><td>{r['ret_h'].mean() * 100:+.2f}%</td><td>{(r['ret_h'].mean() - COST) * 100:+.2f}%</td><td colspan=6>基準</td></tr>"
+    return html + "</table></div>"
 
 
 def exit_compare(trades):
@@ -693,6 +732,10 @@ def main():
     jobs = [(d, len(d) - YEARS * 245, t.replace(".T", "")) for t, d in data.items()]
     with Pool() as p:
         trades = [x for ts in p.map(run_stock, jobs) for x in ts]
+    if HOLD_TEST:
+        (OUT / "hold_compare.html").write_text("<meta charset=utf-8><meta name=viewport content='width=device-width'><style>body{font:14px sans-serif;margin:12px}.w{overflow-x:auto}td,th{border:1px solid #ccc;padding:3px 6px;white-space:nowrap}</style>" + hold_compare(trades), encoding="utf-8")
+        print("done hold_compare", len(trades))
+        return
     base_trades = [x for x in trades if x["strategy"] in CHECKS]   # 本番の6条件だけ（追加パターンはサイトの成績表に混ぜない）
     rows = summarize(base_trades, mood)
     sim_html, model = portfolio(base_trades, mood)
