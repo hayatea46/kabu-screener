@@ -377,22 +377,34 @@ def build_site(results, mood, council, keys, edge):
 
 
 HOLDINGS = {"6849": ("日本光電工業", 1527, 1828), "8081": ("カナデン", 2576, 3190)}   # 紙上トレードの保有銘柄 コード: (名前, 損切り値, 目標値)
+REFERENCE = {"7599": ("ＩＤＯＭ", 877, 1147, "2026-10-20"), "3558": ("ジェイドグループ", 1517, 1832, "2026-10-21")}   # 枠が満杯で見送った高勝率候補を参考に追跡 コード: (名前, 損切り値, 目標値, 判定日)
+
+
+def track(data, table):
+    """銘柄ごとに直近の始値・高値・安値・終値と、終値での損切り／利確の判定を作る"""
+    out = {}
+    for code, (name, stop, target, *rest) in table.items():
+        d = data.get(code + ".T")
+        if d is None or d.empty:
+            out[code] = {"銘柄名": name, "判定": "株価を取得できず"}
+            continue
+        last = float(d["Close"].iloc[-1])
+        out[code] = {"銘柄名": name, "損切り値": stop, "目標値": target, "最新終値": round(last, 1),
+                     "判定": "損切り（翌朝の寄付で売る）" if last <= stop else "利確（翌朝の寄付で売る）" if last >= target else "継続",
+                     "直近": [[str(i.date()), round(float(r["Open"]), 1), round(float(r["High"]), 1), round(float(r["Low"]), 1), round(float(r["Close"]), 1)]
+                            for i, r in d.tail(6).iterrows()]}
+        if rest:
+            out[code]["判定日"] = rest[0]
+    return out
 
 
 def write_holdings(data):
-    """保有銘柄の直近の始値・高値・安値・終値と、終値での損切り／利確の判定を docs/holdings.json に書く（失敗しても毎日の実行は止めない）"""
+    """保有銘柄と参考銘柄の直近の値と判定を docs/holdings.json に書く（失敗しても毎日の実行は止めない）"""
     try:
-        out = {}
-        for code, (name, stop, target) in HOLDINGS.items():
-            d = data.get(code + ".T")
-            if d is None or d.empty:
-                out[code] = {"銘柄名": name, "判定": "株価を取得できず"}
-                continue
-            last = float(d["Close"].iloc[-1])
-            out[code] = {"銘柄名": name, "損切り値": stop, "目標値": target, "最新終値": round(last, 1),
-                         "判定": "損切り（翌朝の寄付で売る）" if last <= stop else "利確（翌朝の寄付で売る）" if last >= target else "継続",
-                         "直近": [[str(i.date()), round(float(r["Open"]), 1), round(float(r["High"]), 1), round(float(r["Low"]), 1), round(float(r["Close"]), 1)]
-                                for i, r in d.tail(6).iterrows()]}
+        out = track(data, {k: v + ("",) for k, v in HOLDINGS.items()})
+        for v in out.values():
+            v.pop("判定日", None)
+        out["参考"] = track(data, REFERENCE)
         (OUT / "holdings.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception as e:
         print("保有銘柄の出力エラー:", e)
