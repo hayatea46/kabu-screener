@@ -1,7 +1,7 @@
 name: daily-screen
 on:
   schedule:
-    - cron: "30 7 * * 1-5"   # 平日16:30(日本時間)
+    - cron: "23 7 * * 1-5"   # 平日16:23(日本時間)。毎時0分・30分は混むので外す
   workflow_dispatch:          # 手動実行ボタン
 permissions:
   contents: write
@@ -15,6 +15,18 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: python screener.py
+      - name: 古い株価で上書きしない
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          def last(d):
+              return max(v["直近"][-1][0] for k, v in d.items() if k != "参考")
+          new = json.load(open("docs/holdings.json", encoding="utf-8"))
+          old = json.loads(subprocess.run(["git", "show", "HEAD:docs/holdings.json"], capture_output=True, text=True).stdout or "{}")
+          if old and last(new) < last(old):
+              print("新しい結果が古いので破棄:", last(new), "<", last(old))
+              subprocess.run(["git", "checkout", "--", "docs"])
+          PY
       - run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
